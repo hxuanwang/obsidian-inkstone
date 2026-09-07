@@ -1,0 +1,13 @@
+import { cpSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
+const manifest = JSON.parse(readFileSync('manifest.json', 'utf8'));
+const target = resolve('release/inkstone');
+rmSync(target, {recursive: true, force: true}); mkdirSync(target, {recursive:true});
+for (const file of ['main.js','manifest.json','styles.css','README.md']) cpSync(file, `${target}/${file}`);
+cpSync('assets', `${target}/assets`, {recursive:true});
+const archive = `inkstone-${manifest.version}.zip`;
+rmSync(resolve('release', archive), {force:true});
+execFileSync('zip', ['-qr',archive,'inkstone'], {cwd:resolve('release')});
+execFileSync('unzip', ['-t',archive], {cwd:resolve('release'),stdio:'ignore'});
+console.log(`Packaged release/${archive} with offline OCR assets.`);

@@ -1,0 +1,9 @@
+Local OCR assets for Inkstone
+
+Tesseract.js 6.0.1 and Tesseract.js-core 6.x: Apache License 2.0, included.
+English model: @tesseract.js-data/eng 1.0.0, 4.0.0_best_int, Apache License 2.0.
+Source: https://github.com/naptha/tessdata
+
+The .wasm.js engines contain embedded WASM. Both SIMD and non-SIMD engines
+are included for mobile compatibility. No remote OCR service is used.
+English OCR accuracy varies substantially for handwriting; review transcripts.

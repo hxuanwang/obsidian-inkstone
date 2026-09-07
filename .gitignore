@@ -1,0 +1,7 @@
+node_modules/
+main.js
+demo/app.js
+.DS_Store
+
+.playwright-cli/
+release/
