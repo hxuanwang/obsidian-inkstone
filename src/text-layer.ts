@@ -6,6 +6,7 @@ type Viewport = { x: number; y: number; zoom: number };
 export class TextLayer {
   private layer = document.createElement('div');
   private enabled = false;
+  private spellcheck = true;
   private boxes: TextBox[] = [];
   private revision = 0;
   private query = '';
@@ -35,6 +36,7 @@ export class TextLayer {
       surface.addEventListener(name,fn); this.cleanup.push(()=>surface.removeEventListener(name,fn));
     }
   }
+  setSpellcheck(enabled:boolean):void { this.spellcheck=enabled; for(const input of this.layer.querySelectorAll('textarea'))input.spellcheck=enabled; }
   setEnabled(enabled:boolean):void { this.enabled=enabled;for(const input of this.layer.querySelectorAll('textarea')){input.readOnly=!enabled;input.tabIndex=enabled?0:-1;} this.layer.classList.toggle('is-editing',enabled); this.tap=null; this.pointers.clear(); if(!enabled) (this.layer.querySelector(':focus') as HTMLElement)?.blur(); }
   setBoxes(boxes:TextBox[]=[]):void { this.revision++;this.tap=null;this.pointers.clear();this.boxes=boxes;this.render(); }
   setQuery(query:string):void {this.query=query;this.markMatches();}
@@ -62,7 +64,7 @@ export class TextLayer {
       const size=document.createElement('select');size.setAttribute('aria-label','Text font size');
       for(const n of [20,28,36,48,64]){const option=document.createElement('option');option.value=String(n);option.textContent=`${n}`;size.append(option);}size.value=String(box.fontSize);
       size.addEventListener('change',()=>{this.update(box.id,{fontSize:Number(size.value)});node.style.fontSize=`${size.value}px`;});
-      const input=document.createElement('textarea');input.className='inkstone-page-text-input';input.value=box.text;input.readOnly=!this.enabled;input.tabIndex=this.enabled?0:-1;input.spellcheck=true;input.placeholder='Type here…';input.setAttribute('aria-label','Text on page');
+      const input=document.createElement('textarea');input.className='inkstone-page-text-input';input.value=box.text;input.readOnly=!this.enabled;input.tabIndex=this.enabled?0:-1;input.spellcheck=this.spellcheck;input.placeholder='Type here…';input.setAttribute('aria-label','Text on page');
       input.maxLength=Math.min(10000,MAX_TEXT_LENGTH-this.boxes.reduce((n,b)=>n+(b.id===box.id?0:b.text.length),0));
       input.addEventListener('input',()=>{const remaining=MAX_TEXT_LENGTH-this.boxes.reduce((n,b)=>n+(b.id===box.id?0:b.text.length),0);if(input.value.length>remaining)input.value=input.value.slice(0,remaining);this.update(box.id,{text:input.value});this.markMatches();});
       for(const event of ['pointerdown','pointermove','pointerup','pointercancel','wheel'])node.addEventListener(event,e=>e.stopPropagation());

@@ -1,4 +1,10 @@
-import { createWorker, OEM, PSM, type Worker } from 'tesseract.js';
+import type { createWorker, Worker, PSM } from 'tesseract.js';
+
+// Keep Tesseract initialization out of Obsidian startup and empty-page views.
+const lazyCreateWorker: typeof createWorker = async (...args) => {
+  const engine = await import('tesseract.js');
+  return engine.createWorker(...args);
+};
 import { PAGE_HEIGHT, PAGE_WIDTH, type InkPage, type Stroke, type RecognitionWord } from './model';
 
 import { inkSignature } from './ink-signature';
@@ -15,7 +21,7 @@ export class LocalRecognizer {
   private readonly base: string;
   private rejectOperation: ((error: Error) => void) | undefined;
 
-  constructor(resourceBase: string, private readonly workerFactory = createWorker, private readonly timeoutMs = 120_000) {
+  constructor(resourceBase: string, private readonly workerFactory = lazyCreateWorker, private readonly timeoutMs = 120_000) {
     // Obsidian resource URLs may carry a cache query. Appending a filename after
     // that query requests the directory itself instead of the OCR asset.
     this.base = resourceBase.split(/[?#]/, 1)[0].replace(/\/$/, '');
@@ -47,7 +53,7 @@ export class LocalRecognizer {
         if (!this.worker) {
           let abandoned = false;
           try {
-            this.worker = await this.runOperation(() => this.workerFactory('eng', OEM.LSTM_ONLY, {
+            this.worker = await this.runOperation(() => this.workerFactory('eng', 1 /* LSTM_ONLY */, {
               workerPath: `${this.base}/worker.min.js`,
               corePath: this.base,
               langPath: this.base,
@@ -62,7 +68,7 @@ export class LocalRecognizer {
               return worker;
             }));
           } catch (error) { abandoned = true; throw error; }
-          await this.runOperation(() => this.worker!.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT, user_defined_dpi: '150' }));
+          await this.runOperation(() => this.worker!.setParameters({ tessedit_pageseg_mode: '11' as PSM /* SPARSE_TEXT */, user_defined_dpi: '150' }));
         }
         if (this.closed) throw new Error('Text recognition was cancelled.');
         const result = await this.runOperation(() => this.worker!.recognize(canvas!, {}, { text: true, blocks: true }));

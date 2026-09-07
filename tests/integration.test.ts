@@ -23,8 +23,12 @@ const doubles: Record<string, string> = {
     export class Plugin {
       constructor(app) { this.app = app; this.manifest = {id:'inkstone',dir:'.obsidian/plugins/inkstone'}; }
       registerView(_type, factory) { state.factory = factory; }
+      async loadData() { return null; } async saveData() {} addSettingTab() {}
       registerExtensions() {} addRibbonIcon() {} addCommand() {} registerEvent() {}
     }
+    export class Setting {}
+    export const requestUrl = async () => { throw new Error('Unexpected network request'); };
+    export class PluginSettingTab {}
     export class Modal {}
     export class TFile {}
     export class Notice { constructor(message) { state.messages.push(message); } }
@@ -55,8 +59,8 @@ async function fixture() {
   const state: any = { editors: [], saveRequests: 0, classes: [], messages: [] };
   const module = { exports: {} as any };
   const result = await bundled;
-  runInNewContext(result.outputFiles[0].text, { module, exports: module.exports, state, crypto });
-  const plugin = new module.exports.default({ workspace: { on() {}, onLayoutReady() {}, getLeavesOfType() { return []; } }, vault: { configDir: '.obsidian', adapter: { getResourcePath(path: string) { return path; } }, on() {} } });
+  runInNewContext(result.outputFiles[0].text, { module, exports: module.exports, state, crypto, setTimeout, clearTimeout });
+  const plugin = new module.exports.default({ workspace: { on() {}, onLayoutReady() {}, getLeavesOfType() { return []; }, getActiveViewOfType() {return null;} }, vault: { configDir: '.obsidian', adapter: { getResourcePath(path: string) { return path; } }, on() {} } });
   await plugin.onload();
   const fileA = { basename: 'First', path: 'First.inkstone' };
   const view = state.factory({ file: fileA });
@@ -171,4 +175,52 @@ test('note view forwards a search query after switching to the result page', asy
   const editor = state.editors.at(-1);
   assert.equal(editor.activePage, 'page1');
   assert.equal(editor.searchQuery, 'handwritten word');
+});
+
+test('startup and ordinary vault edits do not read files or build the search index',async()=>{
+  const {plugin}=await fixture();
+  let reads=0;
+  plugin.app.vault.cachedRead=async()=>{reads++;return '# note';};
+  const file={path:'note.md',extension:'md',basename:'note'};
+  plugin.queueIndex(file);
+  plugin.indexLiveDocument({path:'note.inkstone',extension:'inkstone',basename:'note'},createDocument());
+  assert.equal(reads,0);assert.equal(plugin.index.size,0);assert.equal(plugin.indexTimers.size,0);
+  assert.equal(plugin.indexStarted,false);plugin.onunload();
+});
+
+test('index events coalesce and unloading cancels queued work',async()=>{
+  const {plugin}=await fixture();plugin.indexStarted=true;
+  const file={path:'note.md',extension:'md',basename:'note'};
+  for(let i=0;i<50;i++)plugin.queueIndex(file);
+  assert.equal(plugin.indexTimers.size,1);
+  plugin.onunload();assert.equal(plugin.indexTimers.size,0);
+});
+
+test('a search read started before a rename cannot replace the new path index', async () => {
+  const { plugin } = await fixture();
+  const file = { path: 'before.md', extension: 'md', basename: 'before' };
+  let finishRead!: (source: string) => void;
+  plugin.app.vault.cachedRead = () => new Promise(resolve => { finishRead = resolve; });
+  const pending = plugin.indexFile(file);
+  file.path = 'after.md'; file.basename = 'after';
+  // Both path counters may coincidentally have the same revision.
+  plugin.indexRevisions.set('after.md', 1);
+  plugin.index.markdown('after.md', 'after', 'current content');
+  finishRead('outdated content');
+  await pending;
+  assert.equal(plugin.index.search('current').length, 1);
+  assert.equal(plugin.index.search('outdated').length, 0);
+  plugin.onunload();
+});
+
+test('empty OCR does not erase an existing transcript or write the note', async () => {
+  const { plugin, fileA } = await fixture();
+  const note = createDocument();
+  note.pages[0].transcript = 'Reviewed handwriting';
+  (note.pages[0].strokes as any[]).push({ id: 's1', tool: 'pen', color: '#123456', width: 3, points: [{ x: 10, y: 20, pressure: .5, time: 0 }] });
+  plugin.app.vault.read = async () => JSON.stringify(note);
+  plugin.app.vault.process = async () => { assert.fail('An empty OCR result must not write the note'); };
+  plugin.recognizer.recognize = async () => recognized('  ', note.pages[0].strokes);
+  await plugin.recognizeFilePage(fileA, 'page1');
+  plugin.onunload();
 });

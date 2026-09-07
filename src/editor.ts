@@ -1,3 +1,4 @@
+import { DEFAULT_SETTINGS, type InkstoneSettings, type PencilAction } from './settings';
 import { TextLayer, appendTextToSvg } from './text-layer';
 import { InkEngine } from './ink-engine';
 import { NoteIndex } from './search';
@@ -8,6 +9,10 @@ import { createPage, MAX_PAGES, MAX_TEXT_LENGTH, type InkDocument, type InkPage,
 
 type Tool = 'pen' | 'highlighter' | 'eraser' | 'hand' | 'lasso' | 'shape' | 'text';
 export interface EditorOptions {
+  settings?: InkstoneSettings;
+  onSettingsChange?: (patch: Partial<InkstoneSettings>) => void;
+  onMarkdown?: (doc: InkDocument) => void;
+  onAI?: (page: InkPage, svg: string) => Promise<void>;
   document: InkDocument;
   title: string;
   onChange: (doc: InkDocument) => void;
@@ -54,8 +59,11 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, te
   if (text) node.textContent = text; return node;
 }
 export class InkEditor {
+  private pageControls!: HTMLElement;
   private textLayer!: TextLayer;
   private pagePullHint!: HTMLElement;
+  private pagePullLabel!: HTMLElement;
+  private pagePullRing!: HTMLElement;
   private pageFilter!: HTMLSelectElement;
   private pageMenu!: HTMLDetailsElement;
   private textUndo: InkPage['textBoxes'][] = [];
@@ -71,6 +79,10 @@ export class InkEditor {
   private paperSelect: HTMLSelectElement;
   private toolButtons = new Map<Tool, HTMLButtonElement>();
   private selectedTool: Tool = 'pen';
+  private previousTool: Tool = 'highlighter';
+  private writingTool: Tool = 'pen';
+  private pencilPalette!: HTMLElement;
+  private eraserSelect!: HTMLSelectElement;
   private color = '#243c34';
   private toolColors = {pen: '#243c34', highlighter: '#e7bb4b'};
   private swatches: HTMLButtonElement[] = [];
@@ -81,6 +93,10 @@ export class InkEditor {
   private pagesToggle!: HTMLButtonElement;
   private notesToggle!: HTMLButtonElement;
   private sizeSelect: HTMLSelectElement;
+  private sizeSlider!: HTMLInputElement;
+  private floatingPalette!: HTMLElement;
+  private recognitionTimer?: ReturnType<typeof setTimeout>;
+  private pendingOCR = new Set<string>();
   private widths = {pen: 3, highlighter: 22, eraser: 20, hand: 3, lasso: 3, shape: 3, text: 28};
   private cleanup: (() => void)[] = [];
 
@@ -113,7 +129,7 @@ export class InkEditor {
     this.document = options.document;
     this.activePageId = options.document.pages.find(page => page.id === options.initialPageId)?.id ?? options.document.pages[0].id;
     this.root = el('section', 'inkstone-editor');
-    if (host.clientWidth >= 1000) this.root.classList.add('inkstone-pages-open');
+    this.root.dataset.toolbarSize = options.settings?.toolbarSize ?? 'system';
     this.root.setAttribute('aria-label', 'Inkstone handwriting editor');
     const header = el('header', 'inkstone-header');
     const navigation = el('div', 'inkstone-navigation');
@@ -138,13 +154,13 @@ export class InkEditor {
     header.append(navigation, actions);
 
     const workspace = el('div', 'inkstone-workspace');
-    const toolbar = el('div', 'inkstone-toolbar'); toolbar.setAttribute('role', 'group'); toolbar.setAttribute('aria-label', 'Pen settings');
+    const toolbar = this.floatingPalette = el('div', 'inkstone-toolbar'); toolbar.setAttribute('role', 'group'); toolbar.setAttribute('aria-label', 'Tool settings');
     const history = el('div', 'inkstone-tool-group');
     this.undoButton = this.button('undo', 'Undo (⌘Z)', () => this.undo());
     this.redoButton = this.button('redo', 'Redo (⇧⌘Z)', () => this.redo());
     history.append(this.undoButton, this.redoButton);
     const tools = el('div', 'inkstone-primary-tools'); tools.setAttribute('role', 'group'); tools.setAttribute('aria-label', 'Writing tools');
-    for (const [tool, label] of [['pen', 'Pen'], ['highlighter', 'Highlighter'], ['eraser', 'Stroke eraser'], ['lasso', 'Lasso selection'], ['shape', 'Shape recognition'], ['hand', 'Move page'], ['text', 'Text tool']] as const) {
+    for (const [tool, label] of [['pen', 'Pen'], ['highlighter', 'Highlighter'], ['eraser', 'Eraser'], ['lasso', 'Lasso selection'], ['shape', 'Shape recognition'], ['hand', 'Move page'], ['text', 'Text tool']] as const) {
       const button = this.button(tool, label, () => this.selectTool(tool));
       button.setAttribute('aria-pressed', String(tool === 'pen'));
       button.dataset.tool = tool; this.toolButtons.set(tool, button); tools.append(button);
@@ -174,7 +190,17 @@ export class InkEditor {
     this.toolLabel = el('span', 'inkstone-current-tool', 'Pen');
     const currentTool = el('div', 'inkstone-tool-caption'); currentTool.append(icon('nib'), this.toolLabel);
     this.sizePresets = el('div', 'inkstone-size-presets'); this.sizePresets.setAttribute('role', 'group'); this.sizePresets.setAttribute('aria-label', 'Quick stroke sizes');
-    toolbar.append(currentTool, this.sizePresets, colors, weight);
+    this.eraserSelect = el('select', 'inkstone-select'); this.eraserSelect.setAttribute('aria-label', 'Eraser mode');
+    for(const [value,label] of [['object','Object eraser'],['pixel','Pixel eraser']]) {const option=el('option','',label);option.value=value;this.eraserSelect.append(option);}
+    this.eraserSelect.value=options.settings?.eraserMode ?? 'object'; this.eraserSelect.hidden=true;
+    this.eraserSelect.addEventListener('change',()=>{const mode=this.eraserSelect.value as 'pixel'|'object';this.engine.setEraserMode(mode);options.onSettingsChange?.({eraserMode:mode});});
+    this.sizeSlider = el('input', 'inkstone-size-slider'); this.sizeSlider.type = 'range';
+    this.sizeSlider.setAttribute('aria-label', 'Tool size');
+    this.sizeSlider.addEventListener('input', () => {
+      this.widths[this.selectedTool] = Number(this.sizeSlider.value);
+      this.engine.setWidth(this.widths[this.selectedTool]); this.updateSizes();
+    });
+    toolbar.append(currentTool, this.eraserSelect, this.sizePresets, colors, weight, this.sizeSlider);
     tools.append(this.notesToggle); navigation.append(history); header.insertBefore(tools, actions);
     const surface = el('div', 'inkstone-surface'); surface.tabIndex = 0;
     surface.setAttribute('aria-label', 'Handwriting canvas. Use Apple Pencil or mouse to write; fingers move and zoom the page.');
@@ -183,8 +209,16 @@ export class InkEditor {
       this.button('eraser', 'Delete selection', () => this.engine.deleteSelection(), 'Delete'),
       this.button('lasso', 'Clear selection', () => this.engine.clearSelection(), 'Deselect'));
     this.pagePullHint = el('div', 'inkstone-page-pull'); this.pagePullHint.hidden = true;
-    this.pagePullHint.setAttribute('role','status');
-    workspace.append(surface, toolbar, this.selectionActions, this.pagePullHint);
+    this.pagePullLabel=el('span','inkstone-pull-label','Pull to add page');this.pagePullLabel.setAttribute('role','status');
+    this.pagePullRing=el('div','inkstone-pull-ring');this.pagePullRing.setAttribute('role','progressbar');this.pagePullRing.setAttribute('aria-label','Pull to add page');this.pagePullRing.setAttribute('aria-valuemin','0');this.pagePullRing.setAttribute('aria-valuemax','100');
+    this.pagePullRing.append(icon('plus'));
+    const preview=el('div','inkstone-pull-preview');preview.setAttribute('aria-hidden','true');
+    this.pagePullHint.append(el('span','inkstone-pull-arrow','↑'),this.pagePullRing,this.pagePullLabel,preview);
+    const exitFocus=this.button('close','Exit focus mode',()=>this.root.classList.remove('inkstone-focus-mode'),'Exit focus');exitFocus.classList.add('inkstone-exit-focus');
+    this.pencilPalette=el('div','inkstone-pencil-palette');this.pencilPalette.hidden=true;this.pencilPalette.setAttribute('role','dialog');this.pencilPalette.setAttribute('aria-label','Tool palette');
+    for(const [tool,label] of [['pen','Pen'],['highlighter','Highlighter'],['eraser','Eraser'],['lasso','Lasso'],['shape','Shapes'],['hand','Move'],['text','Text']] as const)this.pencilPalette.append(this.button(tool,label,()=>{this.selectTool(tool);this.pencilPalette.hidden=true;surface.focus();},label));
+    this.pencilPalette.append(this.button('close','Close tool palette',()=>{this.pencilPalette.hidden=true;surface.focus();}));
+    workspace.append(surface, toolbar, this.selectionActions, this.pagePullHint,exitFocus,this.pencilPalette);
 
     const footer = el('footer', 'inkstone-footer');
     const left = el('div', 'inkstone-footer-group');
@@ -214,7 +248,10 @@ export class InkEditor {
     const body = el('div', 'inkstone-body');
     this.buildSidebar(); this.buildNotesPanel();
     body.append(this.sidebar, workspace, this.notesPanel);
-    this.root.append(header, body, footer); host.append(this.root);
+    // Keep navigation and tools in one fixed row; secondary page controls live in the menu.
+    footer.classList.add('inkstone-page-controls-menu');
+    this.root.append(header, body); host.append(this.root);
+    this.pageControls = footer;
     this.engine = new InkEngine(surface, {
       document: this.getActivePage(),
       onChange: page => {
@@ -225,19 +262,30 @@ export class InkEditor {
         if (current.strokes !== page.strokes) this.engine.setSearchHighlights([]);
         this.document = { ...this.document, pages: this.document.pages.map(item => item.id === page.id ? merged : item) };
         this.updateState(merged); this.emitChange(); this.schedulePages();
+        if (current.strokes !== page.strokes) this.scheduleRecognition(page.id);
+      },
+      onActivePageChange: page => {
+        this.activePageId = page.id;
+        this.syncPageFields(); this.updateState(this.getActivePage()); this.schedulePages(); this.updateSearchHighlights();
       },
       onSelectionChange: count => { this.selectionActions.hidden = count === 0; },
       onViewportChange: scale => { zoom.textContent = `${Math.round(scale * 100)}%`; this.textLayer?.position(); },
       onPagePull: progress => {
         this.pagePullHint.hidden = progress === 0;
-        const last=this.activePageId===this.document.pages.at(-1)?.id;
-        this.pagePullHint.textContent = last && this.document.pages.length>=MAX_PAGES ? '500-page limit reached' : progress>=1 ? (last?'Release to add a page':'Release for next page') : (last?'Pull up to add a page':'Pull up for next page');
+        const label=this.document.pages.length>=MAX_PAGES ? '500-page limit reached' : progress>=1 ? 'Release to add page' : 'Pull to add page';
+        if(this.pagePullLabel.textContent!==label)this.pagePullLabel.textContent=label;
+        this.pagePullRing.setAttribute('aria-valuenow',String(Math.round(progress*100)));
+        this.pagePullRing.setAttribute('aria-label','Pull to add page');
+        this.pagePullHint.dataset.paper=this.document.pages.at(-1)!.paper;
+        this.pagePullHint.dataset.ready=String(progress>=1);
         this.pagePullHint.style.setProperty('--pull',String(progress));
+        const lift=Math.min(240,surface.clientHeight*.45)*progress;
+        surface.style.setProperty('--ink-pull-lift',`${-lift}px`);
+        this.pagePullHint.style.height=`${lift+28}px`;
+        const viewport=this.engine?.getViewport();
+        if(viewport)this.pagePullHint.style.width=`${Math.min(surface.clientWidth-32,1400*viewport.zoom)}px`;
       },
-      onPageAdvance: () => {
-        const next=this.document.pages[this.document.pages.findIndex(page=>page.id===this.activePageId)+1];
-        if(next)this.setActivePage(next.id);else this.addPage();
-      },
+      onPageAdvance: () => this.addPage(false, false, true),
     });
     this.textLayer = new TextLayer(surface,()=>this.engine.getViewport(),boxes=>{
       const now=Date.now();
@@ -247,14 +295,25 @@ export class InkEditor {
       this.lastTextEdit=now;this.textRedo=[];
       this.updatePage({textBoxes:boxes});this.updateState(this.getActivePage());
     },()=>this.color);
+    this.engine.setPages(this.document.pages);
     this.engine.setColor(this.color); this.engine.setWidth(this.widths.pen);
+    this.engine.setEraserMode(options.settings?.eraserMode ?? 'object');
     this.updateSizes(); this.updateState(this.getActivePage()); this.syncPageFields(); this.renderPages();
+    this.applySettings(options.settings ?? DEFAULT_SETTINGS);
     const onKey = (event: KeyboardEvent) => {
       if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement || (event.target as HTMLElement).isContentEditable) return;
+      if (!event.metaKey && !event.ctrlKey && !event.altKey) {
+        const tool = ({p:'pen',h:'highlighter',e:'eraser',l:'lasso',v:'hand',t:'text',s:'shape'} as Record<string,Tool>)[event.key.toLowerCase()];
+        if(tool){event.preventDefault();this.selectTool(tool);}
+        if(event.key==='Tab' && event.target===surface){event.preventDefault();this.root.classList.toggle('inkstone-focus-mode');}
+        if(event.key==='Escape'){this.pencilPalette.hidden=true;this.root.classList.remove('inkstone-focus-mode');this.engine.clearSelection();}
+      }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
         event.preventDefault(); event.stopPropagation(); event.shiftKey ? this.redo() : this.undo();
       }
     };
+    const onVisible = () => { if (!document.hidden) this.scheduleRecognition(); };
+    document.addEventListener('visibilitychange', onVisible); this.cleanup.push(() => document.removeEventListener('visibilitychange', onVisible));
     this.root.addEventListener('keydown', onKey); this.cleanup.push(() => this.root.removeEventListener('keydown', onKey));
   }
   private button(name: string, label: string, action: () => void, text?: string): HTMLButtonElement {
@@ -262,6 +321,11 @@ export class InkEditor {
     if (text) b.append(el('span', '', text)); b.addEventListener('click', action); return b;
   }
   private selectTool(tool: Tool): void {
+    if(tool!==this.selectedTool)this.previousTool=this.selectedTool;
+    if(tool!=='eraser')this.writingTool=tool;
+    this.eraserSelect.hidden=tool!=='eraser';
+    this.floatingPalette.hidden=['hand','lasso'].includes(tool);
+    this.floatingPalette.dataset.tool=tool;
     this.selectedTool = tool; this.engine.setTool(tool === 'text' ? 'hand' : tool); this.textLayer.setEnabled(tool==='text');this.root.classList.toggle('inkstone-text-tool',tool==='text');
     this.hint.textContent=tool==='text'?'Tap the page to type. Drag Move to position text.':tool==='shape'?'Draw one shape, then lift to straighten.':'Pencil writes. Fingers move.';
     if (tool === 'pen' || tool === 'highlighter' || tool === 'shape') { this.color = this.toolColors[tool === 'highlighter' ? 'highlighter' : 'pen']; this.engine.setColor(this.color); }
@@ -270,14 +334,36 @@ export class InkEditor {
     this.toolLabel.textContent = ({pen:'Pen',highlighter:'Highlighter',eraser:'Eraser',hand:'Move',lasso:'Lasso',shape:'Shapes',text:'Text'})[tool];
     this.updateColors(); this.updateSizes(); this.updateState(this.getActivePage());
   }
+  applySettings(settings: InkstoneSettings): void {
+    this.options.settings = settings;
+    this.root.dataset.toolbarSize=settings.toolbarSize;
+    this.typedText.spellcheck = settings.spellcheck; this.transcript.spellcheck = settings.spellcheck;
+    this.textLayer.setSpellcheck(settings.spellcheck);
+    if (!settings.realTimeOCR) { clearTimeout(this.recognitionTimer); this.pendingOCR.clear(); }
+    this.eraserSelect.value=settings.eraserMode;this.engine.setEraserMode(settings.eraserMode);
+  }
+  performPencilAction(action: PencilAction): void {
+    if(action==='eraser')this.selectTool(this.selectedTool==='eraser'?this.writingTool:'eraser');
+    else if(action==='previous')this.selectTool(this.previousTool);
+    else if(action==='undo')this.undo();
+    else if(action==='palette') {this.pencilPalette.hidden=!this.pencilPalette.hidden;if(!this.pencilPalette.hidden)this.pencilPalette.querySelector<HTMLElement>('button')?.focus();}
+  }
   private updateSizes(): void {
     this.sizeSelect.replaceChildren();
+    const eraser = this.selectedTool === 'eraser';
+    this.sizeSlider.hidden = ['hand','lasso','text'].includes(this.selectedTool);
+    this.sizeSlider.min = eraser ? '4' : '1'; this.sizeSlider.max = eraser ? '100' : this.selectedTool === 'highlighter' ? '60' : '12';
+    this.sizeSlider.step = eraser ? '1' : '.5'; this.sizeSlider.value = String(this.widths[this.selectedTool]);
+    this.sizeSlider.setAttribute('aria-valuetext', `${this.widths[this.selectedTool]} px${eraser ? ' diameter' : ''}`);
     const choices = this.selectedTool === 'highlighter' ? [12, 22, 34] : this.selectedTool === 'eraser' ? [12, 20, 36] : [1.5, 3, 5, 8];
     for (const value of choices) { const option = el('option', '', `${value} px`); option.value = String(value); this.sizeSelect.append(option); }
+    if (!choices.includes(this.widths[this.selectedTool])) {
+      const option = el('option', '', `${this.widths[this.selectedTool]} px`); option.value = String(this.widths[this.selectedTool]); this.sizeSelect.append(option);
+    }
     this.sizePresets.replaceChildren();
     for (const value of choices.slice(0, 3)) {
-      const button = el('button', 'inkstone-size-preset'); button.type = 'button'; button.setAttribute('aria-label', `Stroke size ${value} px`); button.setAttribute('aria-pressed', String(value === this.widths[this.selectedTool]));
-      button.disabled = ['hand','lasso','text'].includes(this.selectedTool); const line = el('span', ''); line.style.height = `${Math.min(7, Math.max(1, value / (this.selectedTool === 'highlighter' ? 5 : 1)))}px`; button.append(line);
+      const button = el('button', 'inkstone-size-preset'); button.type = 'button'; button.setAttribute('aria-label', `${eraser ? 'Eraser diameter' : 'Stroke size'} ${value} px`); button.setAttribute('aria-pressed', String(value === this.widths[this.selectedTool]));
+      button.disabled = ['hand','lasso','text'].includes(this.selectedTool); const line = el('span', ''); line.style.height = `${Math.min(7, Math.max(1, value / (this.selectedTool === 'highlighter' ? 5 : 1)))}px`; if (eraser) { line.className='inkstone-eraser-size'; line.style.width=`${value}px`; line.style.height=`${value}px`; } button.append(line);
       button.addEventListener('click', () => { this.widths[this.selectedTool] = value; this.engine.setWidth(value); this.updateSizes(); }); this.sizePresets.append(button);
     }
     this.sizeSelect.value = String(this.widths[this.selectedTool]); this.sizeSelect.disabled = ['hand','lasso','text'].includes(this.selectedTool);
@@ -289,7 +375,7 @@ export class InkEditor {
     this.paperSelect.value = doc.paper;
     this.pagePosition.textContent = `Page ${this.document.pages.findIndex(page => page.id === doc.id) + 1} of ${this.document.pages.length}`;
   }
-  private emitChange(): void { this.options.onChange(this.document); }
+  private emitChange(): void { this.engine?.setPages(this.document.pages); this.options.onChange(this.document); }
   private updatePage(patch: Partial<InkPage>): void {
     if ('transcript' in patch && !('recognition' in patch)) patch.recognition = undefined;
     this.document = { ...this.document, pages: this.document.pages.map(page => page.id === this.activePageId ? { ...page, ...patch } : page) };
@@ -318,7 +404,7 @@ export class InkEditor {
       this.button('undo', 'Move page earlier', () => this.movePage(-1)), this.button('redo', 'Move page later', () => this.movePage(1)),
       this.button('eraser', 'Delete page', () => this.confirmDeletePage()));
     const inspector = el('details', 'inkstone-page-inspector'); const summary = el('summary', '', 'Page options');
-    inspector.append(summary, this.pageTitle, controls, el('p', 'inkstone-panel-hint', 'Ink undo history resets when you change pages.'));
+    inspector.append(summary, this.pageTitle, controls, el('p', 'inkstone-panel-hint', 'Ink undo history is retained per page while this notebook is open.'));
     this.searchNavigation = el('div', 'inkstone-search-navigation');
     this.searchHint = el('p','inkstone-panel-hint');
     this.searchNavigation.append(this.button('undo','Previous matching page',()=>this.navigateSearch(-1)), this.button('redo','Next matching page',()=>this.navigateSearch(1)));
@@ -344,10 +430,12 @@ export class InkEditor {
       el('p', 'inkstone-panel-hint', 'Your system checks spelling in these text fields. Raw handwritten strokes are not spellchecked.'));
   }
   private schedulePages(): void {
+    if(!this.root.classList.contains('inkstone-pages-open'))return;
     if (this.pagesTimer) clearTimeout(this.pagesTimer);
     this.pagesTimer = setTimeout(() => { this.pagesTimer = undefined; if (this.disposed || !this.root.classList.contains('inkstone-pages-open')) return; if (this.engine.isInteracting()) { this.schedulePages(); return; } this.renderPages(); }, 500);
   }
   private renderPages(): void {
+    if(!this.root.classList.contains('inkstone-pages-open'))return;
     this.pageList.replaceChildren(); this.pageCount.textContent = `All pages · ${this.document.pages.length}`;
     for (const key of this.thumbnailCache.keys()) if (!this.document.pages.some(page => page.id === key)) this.thumbnailCache.delete(key);
     const query = this.searchInput.value.trim();
@@ -385,10 +473,10 @@ export class InkEditor {
     this.pageCount.textContent=query?`${shown} matching ${shown===1?'page':'pages'}`:`${this.pageFilter.selectedOptions[0].textContent} · ${shown}`;
     if (!this.pageList.childElementCount) this.pageList.append(el('p', 'inkstone-panel-hint', 'No matching pages.'));
   }
-  private addPage(duplicate = false, before = false): void {
+  private addPage(duplicate = false, before = false, atEnd = false): void {
     if (this.document.pages.length >= MAX_PAGES) { this.recognitionStatus.textContent = 'This notebook has reached the 500-page limit.'; this.root.classList.add('inkstone-notes-open'); return; }
     this.engine.flush();
-    const active = this.getActivePage();
+    const active = atEnd ? this.document.pages.at(-1)! : this.getActivePage();
     const page = duplicate ? { ...structuredClone(active), id: createPage().id, title: `${active.title} copy`.slice(0, 500) } : createPage(`Page ${this.document.pages.length + 1}`);
     if(!duplicate)page.paper=active.paper;
     const pages = [...this.document.pages]; pages.splice(pages.findIndex(item => item.id === active.id) + (before ? 0 : 1), 0, page);
@@ -409,13 +497,17 @@ export class InkEditor {
   private renderPageMenu(): void {
     const menu=this.pageMenu.querySelector('.inkstone-more-menu')!;menu.replaceChildren();
     const page=this.getActivePage(),index=this.document.pages.findIndex(p=>p.id===page.id);
-    menu.append(el('strong','',`Page ${index+1} · ${page.title}`));
+    menu.append(el('strong','',`Page ${index+1} · ${page.title}`), this.pageControls);
     const action=(label:string,fn:()=>void)=>menu.append(this.button('page',label,()=>{this.pageMenu.open=false;fn();},label));
+    action('Undo',()=>this.undo()); action('Redo',()=>this.redo());
+    action('Focus writing (Tab)',()=>this.root.classList.add('inkstone-focus-mode'));
+    if(this.options.onMarkdown)action('Export notebook as Markdown',()=>{this.engine.flush();this.options.onMarkdown?.(this.document);});
+    if(this.options.onAI)action('Convert page to Markdown with AI…',()=>{this.engine.flush();void this.options.onAI?.(structuredClone(this.getActivePage()),appendTextToSvg(this.engine.exportSvg(),this.getActivePage().textBoxes));});
     action('Add page before',()=>this.addPage(false,true));action('Add page after',()=>this.addPage());
     action('Duplicate page',()=>this.addPage(true));
     action(page.favorite?'Remove from favorites':'Add to favorites',()=>{this.updatePage({favorite:!page.favorite});this.renderPages();});
     action(page.outline?'Remove from outline':'Add to outline',()=>{this.updatePage({outline:!page.outline});this.renderPages();});
-    action('Change paper template',()=>this.paperSelect.focus());
+
     action('Export page as SVG',()=>this.options.onExport(appendTextToSvg(this.engine.exportSvg(),this.getActivePage().textBoxes)));
     const label=el('label','inkstone-go-page','Go to page');const input=el('input','inkstone-input');input.type='number';input.min='1';input.max=String(this.document.pages.length);input.value=String(index+1);input.setAttribute('aria-label','Page number');
     const go=this.button('redo','Go to page',()=>{const page=this.document.pages[Number(input.value)-1];if(page){this.pageMenu.open=false;this.setActivePage(page.id);}},'Go');label.append(input,go);menu.append(label);
@@ -446,26 +538,48 @@ export class InkEditor {
     this.selectionActions.hidden = true;
     this.textLayer?.setBoxes(page.textBoxes);this.textUndo=[];this.textRedo=[];this.lastTextEdit=0;
   }
-  private async recognize(): Promise<void> {
+  private scheduleRecognition(pageId?: string): void {
+    if (!(this.options.settings?.realTimeOCR ?? true) || !this.options.onRecognize || this.disposed) return;
+    if (pageId) this.pendingOCR.add(pageId);
+    clearTimeout(this.recognitionTimer);
+    if (!this.pendingOCR.size) return;
+    this.recognitionTimer = setTimeout(() => {
+      if (this.disposed) return;
+      if (document.hidden) return;
+      if (this.engine.isInteracting() || this.recognitionBusy) { this.scheduleRecognition(); return; }
+      const id = this.pendingOCR.values().next().value!;
+      this.pendingOCR.delete(id); void this.recognize(id, true);
+    }, this.options.settings?.recognitionDelayMs ?? 1800);
+  }
+  private async recognize(pageId = this.activePageId, automatic = false): Promise<void> {
     if (!this.options.onRecognize || this.recognitionBusy) return;
-    this.engine.flush();
-    const page = this.getActivePage(); const pageId = page.id; const lifecycle = this.lifecycle;
-    const strokes = JSON.stringify(page.strokes); const transcript = page.transcript;
-    this.recognitionBusy = true; this.recognizeButton.disabled = true; this.recognitionStatus.textContent = 'Recognizing handwriting…';
+    if (!automatic) this.engine.flush();
+    const page = this.document.pages.find(page => page.id === pageId);
+    if (!page || !page.strokes.length) { this.pendingOCR.delete(pageId); this.scheduleRecognition(); return; }
+    if (automatic && page.recognition?.inkSignature === inkSignature(page.strokes)) {
+      this.pendingOCR.delete(pageId); this.scheduleRecognition(); return;
+    }
+    this.pendingOCR.delete(pageId);
+    const lifecycle = this.lifecycle, strokes = page.strokes, transcript = page.transcript;
+    this.recognitionBusy = true; this.recognizeButton.disabled = true;
+    this.recognitionStatus.textContent = 'Recognizing handwriting locally…';
     try {
-      const result = await this.options.onRecognize(structuredClone(page));
+      const result = await this.options.onRecognize(page);
       if (this.disposed || lifecycle !== this.lifecycle) return;
-      const current = this.getActivePage();
-      if (current.id !== pageId || JSON.stringify(current.strokes) !== strokes || current.transcript !== transcript) {
-        this.recognitionStatus.textContent = 'The page changed during recognition. Recognize again to update its transcript.'; return;
-      }
+      const current = this.document.pages.find(page => page.id === pageId);
+      if (!current || current.strokes !== strokes || current.transcript !== transcript) return;
       if (typeof result.text !== 'string' || result.text.length > MAX_TEXT_LENGTH) throw new Error('Recognition returned an invalid or oversized transcript.');
-      if (!result.text.trim()) { this.recognitionStatus.textContent = 'No text was recognized. The existing transcript was kept.'; return; }
-      this.updatePage({ transcript: result.text, recognition: {transcript:result.text, words:result.words, inkSignature:result.inkSignature} }); this.transcript.value = result.text; this.updateSearchHighlights(); this.recognitionStatus.textContent = result.text ? 'Transcript updated. Review and correct any recognition errors.' : 'No handwriting text was recognized.';
+      if (!result.text.trim()) { this.recognitionStatus.textContent = 'No text recognized. Try AI conversion for cursive handwriting or equations.'; return; }
+      const updated = {...current, transcript:result.text, recognition:{transcript:result.text, words:result.words, inkSignature:result.inkSignature}};
+      this.document = {...this.document, pages:this.document.pages.map(p => p.id === pageId ? updated : p)};
+      this.emitChange(); this.schedulePages();
+      if (this.activePageId === pageId) { this.transcript.value = result.text; this.updateSearchHighlights(); }
+      this.recognitionStatus.textContent = 'Transcript updated. Open Page text to review spelling and recognition.';
     } catch (error) {
       if (!this.disposed && lifecycle === this.lifecycle) this.recognitionStatus.textContent = error instanceof Error ? error.message : String(error);
     } finally {
-      this.recognitionBusy = false; if (!this.disposed) this.recognizeButton.disabled = !this.options.onRecognize;
+      this.recognitionBusy = false;
+      if (!this.disposed) { this.recognizeButton.disabled = !this.options.onRecognize; this.scheduleRecognition(); }
     }
   }
   setSearchQuery(query: string): void {
@@ -502,15 +616,16 @@ export class InkEditor {
   setActivePage(pageId: string): void {
     if (pageId === this.activePageId || !this.document.pages.some(page => page.id === pageId)) return;
     this.sidebar.querySelector('.inkstone-delete-confirm')?.remove();
-    this.engine.flush(); this.activePageId = pageId; this.engine.setDocument(this.getActivePage()); this.engine.fitWidth();
+    this.engine.flush(); this.engine.setPages(this.document.pages); this.activePageId = pageId; this.engine.setDocument(this.getActivePage()); this.engine.fitWidth();
     this.syncPageFields(); this.updateState(this.getActivePage()); this.renderPages(); this.updateSearchHighlights();
   }
   getActivePage(): InkPage { return this.document.pages.find(page => page.id === this.activePageId) ?? this.document.pages[0]; }
   setDocument(doc: InkDocument): void {
-    this.lifecycle++; this.thumbnailCache.clear(); this.signatureCache = new WeakMap(); this.document = doc; this.activePageId = doc.pages[0].id; this.engine.setDocument(this.getActivePage());
+    this.engine.flush(); clearTimeout(this.recognitionTimer); this.pendingOCR.clear();
+    this.lifecycle++; this.thumbnailCache.clear(); this.signatureCache = new WeakMap(); this.document = doc; this.engine.setPages(doc.pages); this.activePageId = doc.pages[0].id; this.engine.setDocument(this.getActivePage());
     this.syncPageFields(); this.updateState(this.getActivePage()); this.renderPages(); this.updateSearchHighlights();
   }
   setTitle(title: string): void { this.titleEl.textContent = title; }
   getDocument(): InkDocument { return this.document; }
-  destroy(): void { this.textLayer.destroy(); this.engine.destroy(); this.disposed = true; this.lifecycle++; if (this.pagesTimer) clearTimeout(this.pagesTimer); this.cleanup.forEach(fn => fn()); this.root.remove(); }
+  destroy(): void { this.textLayer.destroy(); this.engine.destroy(); this.disposed = true; clearTimeout(this.recognitionTimer); this.pendingOCR.clear(); this.lifecycle++; if (this.pagesTimer) clearTimeout(this.pagesTimer); this.cleanup.forEach(fn => fn()); this.root.remove(); }
 }

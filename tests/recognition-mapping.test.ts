@@ -103,3 +103,43 @@ test('destroy cancels startup immediately and terminates a worker that arrives l
     await assert.rejects(recognizer.recognize(inkPage()), /closed/);
   } finally { await recognizer.destroy(); globalThis.document = original; }
 });
+
+test('OCR stays cold for empty ink and serializes exact submitted snapshots', async () => {
+  const original = globalThis.document;
+  const submittedX: number[] = [];
+  globalThis.document = fakeCanvasDocument();
+  const createCanvas = globalThis.document.createElement;
+  globalThis.document.createElement = (() => {
+    const canvas = createCanvas('canvas') as HTMLCanvasElement;
+    const context = canvas.getContext('2d')!;
+    context.arc = (x: number) => { submittedX.push(x); };
+    canvas.getContext = (() => context) as unknown as typeof canvas.getContext;
+    return canvas;
+  }) as typeof document.createElement;
+  let starts = 0, calls = 0, finishFirst!: () => void;
+  const factory: typeof createWorker = async () => {
+    starts++;
+    return fakeWorker({ recognize: (() => {
+      calls++;
+      return calls === 1 ? new Promise(resolve => { finishFirst = () => resolve({ data: { text: 'FIRST', blocks: null } } as never); }) : Promise.resolve({ data: { text: 'SECOND', blocks: null } });
+    }) as Worker['recognize'] });
+  };
+  const recognizer = new LocalRecognizer('/ocr', factory, 1000);
+  try {
+    assert.equal(starts, 0);
+    await recognizer.recognize(createPage());
+    assert.equal(starts, 0, 'Opening an empty note must not start an OCR worker');
+    const first = recognizer.recognize(inkPage());
+    await new Promise(resolve => setImmediate(resolve));
+    const secondPage = inkPage(); secondPage.strokes[0].points[0].x = 150;
+    const signature = inkSignature(secondPage.strokes);
+    const second = recognizer.recognize(secondPage);
+    secondPage.strokes[0].points[0].x = 500;
+    assert.equal(calls, 1, 'Only one page may be recognized at a time');
+    finishFirst();
+    await first;
+    assert.equal((await second).inkSignature, signature);
+    assert.deepEqual(submittedX, [80, 150], 'Queued pages retain ink from submission time');
+    assert.equal(starts, 1, 'Consecutive OCR jobs reuse one worker');
+  } finally { await recognizer.destroy(); globalThis.document = original; }
+});

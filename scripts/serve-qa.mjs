@@ -28,4 +28,4 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store' }); res.end(data);
   } catch { res.writeHead(404); res.end('QA asset unavailable; run npm run prepare:ocr.'); }
 });
-server.listen(5175, '127.0.0.1', () => console.log('Inkstone QA fixture: http://127.0.0.1:5175'));
+server.listen(Number(process.env.INKSTONE_QA_PORT ?? 5175), '127.0.0.1', () => console.log(`Inkstone QA fixture: http://127.0.0.1:${process.env.INKSTONE_QA_PORT ?? 5175}`));

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPage as createDocument, type InkPage as InkDocument } from '../src/model';
-import { InkEngine, pointSegmentDistance } from '../src/ink-engine';
+import { InkEngine, pointSegmentDistance, PAGE_GAP, PAGE_HEIGHT } from '../src/ink-engine';
 
 const note = (): InkDocument => ({
   id: 'page-test', title: 'Test', text: '', transcript: '', paper: 'dots', strokes: [{ id: 'stroke-1', tool: 'pen', color: '#123456', width: 3,
@@ -51,7 +51,7 @@ class Host extends EventTarget {
 }
 
 function withEngine(run: (state: {
-  engine: InkEngine; host: Host; changes: InkDocument[]; viewportChanges: () => number; pulls: number[]; advances: () => number;
+  engine: InkEngine; host: Host; changes: InkDocument[]; activePages: InkDocument[]; viewportChanges: () => number; pulls: number[]; advances: () => number;
   pointer: (type: string, x: number, y: number, values?: Record<string, unknown>) => void;
   event: (x: number, y: number, values?: Record<string, unknown>) => Event;
   flush: () => void; getZoom: () => number; resize: (width: number, height: number) => void;
@@ -71,9 +71,10 @@ function withEngine(run: (state: {
   install('cancelAnimationFrame', (id: number) => frames.delete(id));
   const host = new Host();
   const changes: InkDocument[] = [];
+  const activePages: InkDocument[] = [];
   const pulls: number[] = []; let advances = 0;
   let zoom = 1; let viewportChanges = 0; let timestamp = 0;
-  const engine = new InkEngine(host as unknown as HTMLElement, { document, onChange: value => changes.push(value),
+  const engine = new InkEngine(host as unknown as HTMLElement, { document, onChange: value => changes.push(value), onActivePageChange: page => activePages.push(page),
     onViewportChange: value => { zoom = value; viewportChanges++; }, onPagePull: value => pulls.push(value), onPageAdvance: () => advances++ });
   const event = (x: number, y: number, values: Record<string, unknown> = {}) => {
     const result = new Event('pointermove', { cancelable: true });
@@ -88,7 +89,7 @@ function withEngine(run: (state: {
     host.dispatchEvent(sample);
   };
   const flush = () => { for (const [id, callback] of frames) { frames.delete(id); callback(0); } };
-  try { flush(); run({ engine, host, changes, pulls, advances: () => advances, viewportChanges: () => viewportChanges, pointer, event, flush, getZoom: () => zoom, resize: (width, height) => { host.width = width; host.height = height; onResize(); } }); }
+  try { flush(); run({ engine, host, changes, activePages, pulls, advances: () => advances, viewportChanges: () => viewportChanges, pointer, event, flush, getZoom: () => zoom, resize: (width, height) => { host.width = width; host.height = height; onResize(); } }); }
   finally {
     engine.destroy();
     for (const [name, descriptor] of descriptors) {
@@ -488,4 +489,122 @@ test('overlapping mouse and touch contacts cannot commit a page pull', () => {
       assert.equal(pulls.at(-1), 0);
     });
   }
+});
+
+test('pixel erasing is one undo transaction and redo preserves the gap',()=>{
+  const page=createDocument();page.strokes=[{id:'line',tool:'pen',color:'#123456',width:3,points:[{x:100,y:200,pressure:.5,time:0},{x:500,y:200,pressure:.5,time:10}]}];
+  withEngine(({engine,pointer,changes})=>{
+    engine.setTool('eraser');engine.setEraserMode('pixel');
+    pointer('pointerdown',300,150);pointer('pointermove',300,250);pointer('pointerup',300,250);
+    assert.equal(changes.length,1);assert.equal(changes[0].strokes.length,2);
+    engine.undo();assert.equal(changes.at(-1)!.strokes[0].id,'line');
+    engine.redo();assert.equal(changes.at(-1)!.strokes.length,2);
+  },page);
+});
+
+test('trackpad pull requires a fresh bottom gesture and settles into one page advance',t=>{
+  t.mock.timers.enable({apis:['setTimeout','Date']});
+  withEngine(({host,advances,pulls})=>{
+    wheelTo(host,100000);for(let i=0;i<5;i++)wheelTo(host,60);
+    t.mock.timers.tick(230);assert.equal(advances(),0,'arrival momentum does not add pages');
+    for(let i=0;i<3;i++)wheelTo(host,60);
+    assert.equal(pulls.at(-1),1);assert.equal(advances(),0);
+    t.mock.timers.tick(230);assert.equal(advances(),1);assert.equal(pulls.at(-1),0);
+    for(let i=0;i<4;i++)wheelTo(host,60);
+    t.mock.timers.tick(230);assert.equal(advances(),1,'tail events cannot add a second page');
+  });
+});
+test('reversing a trackpad pull or interrupting it with Pencil cancels page creation',t=>{
+  t.mock.timers.enable({apis:['setTimeout','Date']});
+  withEngine(({host,advances,pointer})=>{
+    wheelTo(host,100000);t.mock.timers.tick(230);
+    for(let i=0;i<3;i++)wheelTo(host,60);wheelTo(host,-60);
+    t.mock.timers.tick(230);assert.equal(advances(),0);
+    wheelTo(host,100000);t.mock.timers.tick(230);
+    for(let i=0;i<3;i++)wheelTo(host,60);
+    pointer('pointerdown',0,0,contact(500,'pen',1));
+    t.mock.timers.tick(230);assert.equal(advances(),0);
+  });
+});
+
+
+test('continuous scrolling crosses page seams without changing world position or pulling', () => {
+  const pages = [createDocument(), createDocument(), createDocument()];
+  withEngine(({ engine, host, activePages, pulls, advances }) => {
+    engine.setPages(pages);
+    const first = engine.getViewport();
+    wheelTo(host, 1000);
+    assert.equal(engine.getDocument().id, pages[1].id);
+    const second = engine.getViewport();
+    const stride = (PAGE_HEIGHT + PAGE_GAP) * second.zoom;
+    assert.ok(Math.abs(second.y - stride - (first.y - 1000)) < 1e-6);
+    wheelTo(host, -1000);
+    assert.equal(engine.getDocument().id, pages[0].id);
+    assert.ok(Math.abs(engine.getViewport().y - first.y) < 1e-6);
+    assert.deepEqual(activePages.map(page => page.id), [pages[1].id, pages[0].id]);
+    assert.deepEqual(pulls, []); assert.equal(advances(), 0);
+  }, pages[0]);
+});
+
+test('drawing targets the touched visible page and preserves separate undo histories', () => {
+  const pages = [createDocument(), createDocument()];
+  withEngine(({ engine, host, pointer }) => {
+    engine.setPages(pages);
+    pointer('pointerdown', 200, 200); pointer('pointerup', 220, 220);
+    wheelTo(host, 800);
+    const view = engine.getViewport();
+    const nextTop = view.y + (PAGE_HEIGHT + PAGE_GAP) * view.zoom;
+    const target = { clientX: view.x + 200 * view.zoom, clientY: nextTop + 100 * view.zoom };
+    pointer('pointerdown', 0, 0, target); pointer('pointerup', 0, 0, target);
+    assert.equal(engine.getDocument().id, pages[1].id);
+    assert.equal(engine.getDocument().strokes.length, 1);
+    assert.ok(Math.abs(engine.getDocument().strokes[0].points[0].y - 100) < 1e-6);
+    engine.undo(); assert.equal(engine.getDocument().strokes.length, 0);
+    wheelTo(host, -800);
+    assert.equal(engine.getDocument().id, pages[0].id);
+    assert.equal(engine.getDocument().strokes.length, 1);
+    engine.undo(); assert.equal(engine.getDocument().strokes.length, 0);
+    engine.redo(); assert.equal(engine.getDocument().strokes.length, 1);
+    wheelTo(host, 1000);
+    assert.equal(engine.getDocument().id, pages[1].id);
+    engine.redo(); assert.equal(engine.getDocument().strokes.length, 1);
+  }, pages[0]);
+});
+
+test('page list synchronization keeps the active paper anchored and never resurrects deleted pages', () => {
+  const pages = [createDocument(), createDocument(), createDocument()];
+  withEngine(({ engine, host }) => {
+    engine.setPages(pages); wheelTo(host, 1000);
+    const before = engine.getViewport();
+    engine.setPages([pages[1], pages[0], pages[2]]);
+    assert.equal(engine.getDocument().id, pages[1].id);
+    assert.deepEqual(engine.getViewport(), before, 'reordering keeps active paper stationary');
+    engine.setPages([pages[0], pages[2]]);
+    assert.equal(engine.getDocument().id, pages[0].id);
+    wheelTo(host, 100000);
+    assert.equal(engine.getDocument().id, pages[2].id, 'surviving last page was not overwritten');
+    engine.setPages([pages[0]]);
+    assert.equal(engine.getDocument().id, pages[0].id);
+    wheelTo(host, 100000);
+    assert.equal(engine.getDocument().id, pages[0].id, 'deleted active page did not extend the notebook');
+  }, pages[0]);
+});
+
+test('finger panning scrolls existing pages and only pulls beyond the last page', () => {
+  const pages = [createDocument(), createDocument()];
+  withEngine(({ engine, host, pointer, pulls, advances }) => {
+    engine.setPages(pages);
+    pointer('pointerdown', 0, 0, contact(1400));
+    pointer('pointermove', 0, 0, contact(400));
+    assert.equal(engine.getDocument().id, pages[1].id);
+    assert.deepEqual(pulls, []);
+    pointer('pointerup', 0, 0, contact(400));
+    assert.equal(advances(), 0);
+    wheelTo(host, 100000);
+    pointer('pointerdown', 0, 0, contact(500));
+    pointer('pointermove', 0, 0, contact(452));
+    assert.equal(pulls.at(-1), 0.5);
+    pointer('pointerup', 0, 0, contact(404));
+    assert.equal(advances(), 1);
+  }, pages[0]);
 });
