@@ -1,14 +1,15 @@
-import { type InkPage as InkDocument, type Paper, type Point, type Stroke, PAGE_HEIGHT, PAGE_WIDTH } from './model';
+import { type InkPage as InkDocument, type PageFormat, type Paper, type PageImage, type Point, type Stroke, isImageSource, MAX_PAGE_IMAGES, pageDimensions, formatPage } from './model';
 import { eraseStroke, type EraserMode } from './eraser';
-import { enclosedStrokes, recognizeShape } from './geometry';
+import { createShape, type ShapeMode, pointInPolygon, enclosedStrokes, recognizeShape } from './geometry';
+import { drawPaper, paperSvg } from './paper';
 export { PAGE_HEIGHT, PAGE_WIDTH } from './model';
 
 type Tool = 'pen' | 'highlighter' | 'eraser' | 'hand' | 'lasso' | 'shape';
 type Options = { document: InkDocument; onChange: (document: InkDocument) => void; onViewportChange?: (zoom: number) => void; onSelectionChange?: (count: number) => void; onPagePull?: (progress: number) => void; onPageAdvance?: () => void; onActivePageChange?: (page: InkDocument) => void };
 export type SearchHighlight = { x: number; y: number; width: number; height: number };
 export const PAGE_GAP = 32;
-const PAGE_STRIDE = PAGE_HEIGHT + PAGE_GAP;
 type XY = { x: number; y: number };
+type HistoryEntry = { page: InkDocument; counterpart: InkDocument };
 const clamp = (n: number, low: number, high: number) => Math.min(high, Math.max(low, n));
 const distance = (a: XY, b: XY) => Math.hypot(a.x - b.x, a.y - b.y);
 const radius = (stroke: Stroke, point: Point) => stroke.width * (stroke.tool === 'highlighter' ? 0.5 : 0.18 + point.pressure * 0.62);
@@ -44,13 +45,17 @@ export class InkEngine {
   private document: InkDocument;
   private pages: InkDocument[];
   private pageIndex = 0;
-  private renderOffset = 0;
+  private renderOffset: XY = { x: 0, y: 0 };
+  private renderPage: InkDocument | null = null;
   private readonly eraserCursor = document.createElement('div');
   private hover: XY | null = null;
-  private readonly histories = new Map<string, { undo: InkDocument[]; redo: InkDocument[] }>();
-  private undoStack: InkDocument[] = [];
-  private redoStack: InkDocument[] = [];
+  private readonly histories = new Map<string, { undo: HistoryEntry[]; redo: HistoryEntry[] }>();
+  private undoStack: HistoryEntry[] = [];
+  private redoStack: HistoryEntry[] = [];
   private tool: Tool = 'pen';
+  private shapeMode: ShapeMode = 'auto';
+  private shapeStart: Point | null = null;
+  private readonly imageCache = new Map<string, HTMLImageElement>();
   private eraserMode: EraserMode = 'object';
   setEraserMode(mode: EraserMode): void { this.flush(); this.eraserMode = mode; }
   private color = '#243247';
@@ -65,7 +70,7 @@ export class InkEngine {
   private erase: { pointerId: number; before: InkDocument; last: XY } | null = null;
   private touches = new Map<number, XY>();
   private pan: { pointerId: number; pointerType: string; last: XY } | null = null;
-  private pagePull: { pointerId: number; origin: XY; rawY: number } | null = null;
+  private pagePull: { pointerId: number; origin: XY; rawY: number; vertical: boolean } | null = null;
   private pagePullProgress = 0;
   private wheelPull: { distance: number; samples: number; eligible: boolean } | null = null;
   private wheelPullTimer: ReturnType<typeof setTimeout> | undefined;
@@ -74,7 +79,7 @@ export class InkEngine {
   private disposed = false;
   private selected = new Set<string>();
   private lasso: { pointerId: number; points: XY[] } | null = null;
-  private drag: { pointerId: number; origin: XY; before: InkDocument; dx: number; dy: number } | null = null;
+  private drag: { pointerId: number; origin: XY; before: InkDocument; dx: number; dy: number; anchor?: XY; box?: { left: number; right: number; top: number; bottom: number } } | null = null;
   private bounds = new WeakMap<Stroke, { left: number; top: number; right: number; bottom: number }>();
 
   constructor(private readonly host: HTMLElement, private readonly options: Options) {
@@ -90,7 +95,7 @@ export class InkEngine {
       this.host.append(canvas);
     }
     this.searchLayer.className = 'inkstone-search-highlights';
-    this.searchLayer.style.cssText = `position:absolute;left:0;top:0;width:${PAGE_WIDTH}px;height:${PAGE_HEIGHT}px;overflow:hidden;pointer-events:none;transform-origin:0 0;`;
+    this.searchLayer.style.cssText = 'position:absolute;left:0;top:0;overflow:hidden;pointer-events:none;transform-origin:0 0;';
     this.searchLayer.setAttribute('aria-hidden', 'true');
     this.host.append(this.searchLayer);
     this.eraserCursor.className = 'inkstone-eraser-cursor';
@@ -120,17 +125,41 @@ export class InkEngine {
   }
 
   setTool(tool: Tool): void { this.cancelPagePull(); this.finishActive(); this.finishErase(); this.finishSelection(); if (tool !== 'lasso') this.clearSelection(); this.tool = tool; this.updateCursor(); }
+  setShapeMode(mode: ShapeMode): void { this.flush(); this.shapeMode = mode; }
   setColor(color: string): void { if (/^#[0-9a-f]{6}$/i.test(color)) this.color = color; }
   setWidth(width: number): void { if (Number.isFinite(width)) { this.width = clamp(width, 0.5, 100); this.positionEraserCursor(); } }
   setFingerDrawing(enabled: boolean): void { this.cancelPagePull(); this.fingerDrawing = enabled; }
-  setPaper(paper: Paper): void {
-    if (paper === this.document.paper) return;
-    this.finishActive(); this.finishErase();
-    this.change({ ...this.document, paper });
+  setPaper(paper: Paper): void { this.setPageFormat({ paper }); }
+  /** Resize artwork uniformly to fit; one undo restores both paper and content. */
+  setPageFormat(format: PageFormat & { paper?: Paper }): void {
+    this.cancelPagePull(); this.flush();
+    const next = formatPage(this.document, format);
+    if (next === this.document) return;
+    this.clearSelection(); this.setSearchHighlights([]);
+    this.change(next);
+  }
+  private get pageSize() { return pageDimensions(this.document); }
+  /** Page coordinates remain local; the notebook stacks centered page rectangles. */
+  private pageLayout() {
+    let height = 0, width = 0;
+    const pages = this.pages.map((stored, index) => {
+      const page = index === this.pageIndex ? this.document : stored;
+      const size = pageDimensions(page), top = height;
+      height += size.height + PAGE_GAP; width = Math.max(width, size.width);
+      return { page, top, ...size };
+    });
+    return { pages, width, height: height - PAGE_GAP };
+  }
+  private pageAt(screenY: number): number {
+    const layout = this.pageLayout();
+    const y = layout.pages[this.pageIndex].top + (screenY - this.offset.y) / this.zoom;
+    const index = layout.pages.findIndex(page => y < page.top + page.height + PAGE_GAP);
+    return index < 0 ? layout.pages.length - 1 : index;
   }
   /** Synchronize notebook pages without disturbing the current gesture or scroll position. */
   setPages(pages: InkDocument[]): void {
     if (!pages.length) return;
+    const previous = this.document;
     const index = pages.findIndex(page => page.id === this.document.id);
     if (index >= 0) {
       this.pages = pages.slice();
@@ -138,6 +167,7 @@ export class InkEngine {
       // offset is relative to the active page: keep that page under the pen
       // when pages before it are inserted, removed, or reordered.
       this.document = this.pages[index];
+      this.refreshPageFormat(previous);
     } else {
       const nextIndex = Math.min(this.pageIndex, pages.length - 1);
       // Save the outgoing history before installing the replacement array.
@@ -160,8 +190,11 @@ export class InkEngine {
   private activatePage(index: number): void {
     if (index === this.pageIndex || !this.pages[index]) return;
     this.flush(); this.rememberPage();
-    this.offset.y += (index - this.pageIndex) * PAGE_STRIDE * this.zoom;
-    if (this.pagePull) this.pagePull.rawY += (index - this.pageIndex) * PAGE_STRIDE * this.zoom;
+    const layout = this.pageLayout(), before = layout.pages[this.pageIndex], after = layout.pages[index];
+    const dy = (after.top - before.top) * this.zoom;
+    this.offset.x += (before.width - after.width) / 2 * this.zoom;
+    this.offset.y += dy;
+    if (this.pagePull) this.pagePull.rawY += dy;
     this.pageIndex = index; this.document = this.pages[index];
     const history = this.histories.get(this.document.id);
     this.undoStack = history?.undo ?? []; this.redoStack = history?.redo ?? [];
@@ -169,6 +202,7 @@ export class InkEngine {
     this.options.onActivePageChange?.(this.document);
   }
   setDocument(document: InkDocument): void {
+    const previous = this.document;
     this.cancelPagePull();
     this.setSearchHighlights([]);
     this.active = null; this.erase = null; this.pan = null; this.lasso = null; this.drag = null; this.clearSelection(); this.touches.clear();
@@ -179,6 +213,7 @@ export class InkEngine {
     this.document = document;
     const history = this.histories.get(document.id);
     this.undoStack = history?.undo ?? []; this.redoStack = history?.redo ?? [];
+    this.refreshPageFormat(previous);
     this.redraw();
   }
   isInteracting(): boolean { return !!(this.active || this.erase || this.lasso || this.drag || this.pan || this.touches.size); }
@@ -191,15 +226,47 @@ export class InkEngine {
     this.finishActive(); this.finishErase(); this.finishSelection(); this.clearSelection();
     const previous = this.undoStack.pop();
     if (!previous) return;
-    this.redoStack.push(this.document); this.document = previous;
+    const current = this.document;
+    this.document = this.restoreHistory(previous);
+    this.redoStack.push({ page: current, counterpart: this.document }); this.refreshPageFormat(current);
     this.redraw(); this.options.onChange(this.document);
   }
   redo(): void {
     this.finishActive(); this.finishErase(); this.finishSelection(); this.clearSelection();
     const next = this.redoStack.pop();
     if (!next) return;
-    this.undoStack.push(this.document); this.document = next;
+    const current = this.document;
+    this.document = this.restoreHistory(next);
+    this.undoStack.push({ page: current, counterpart: this.document }); this.refreshPageFormat(current);
     this.redraw(); this.options.onChange(this.document);
+  }
+  /** Ink history preserves independent text edits, including across paper resizing. */
+  private restoreHistory({ page, counterpart }: HistoryEntry): InkDocument {
+    const current = this.document;
+    const from = pageDimensions(counterpart), to = pageDimensions(page);
+    if (from.width === to.width && from.height === to.height) {
+      if (current.textBoxes === page.textBoxes) return page;
+      const { textBoxes: _oldText, ...inkPage } = page;
+      return { ...inkPage, ...(current.textBoxes !== undefined ? { textBoxes: current.textBoxes } : {}) };
+    }
+    if (current.textBoxes === counterpart.textBoxes) return page;
+    const originals = new Map((page.textBoxes ?? []).map(box => [box.id, box]));
+    const baseline = new Map((counterpart.textBoxes ?? []).map(box => [box.id, box]));
+    const fitted = formatPage({ ...current, strokes: [], images: undefined }, { pageSize: page.pageSize ?? 'standard', orientation: page.orientation ?? 'portrait' });
+    const textBoxes = (current.textBoxes ?? []).map((box, index) => {
+      const original = originals.get(box.id), expected = baseline.get(box.id);
+      if (!original || !expected) return fitted.textBoxes![index];
+      if (box === expected) return original;
+      // Preserve changes relative to the text geometry produced by the format operation.
+      const sx = original.width / expected.width, sy = original.height / expected.height;
+      const width = clamp(original.width + (box.width - expected.width) * sx, 80, to.width);
+      const height = clamp(original.height + (box.height - expected.height) * sy, 40, to.height);
+      return { ...box, width, height,
+        x: clamp(original.x + (box.x - expected.x) * sx, 0, to.width - width),
+        y: clamp(original.y + (box.y - expected.y) * sy, 0, to.height - height),
+        fontSize: clamp(original.fontSize + (box.fontSize - expected.fontSize) * original.fontSize / expected.fontSize, 12, 96) };
+    });
+    return { ...page, textBoxes };
   }
   private pageTop(): number {
     const toolbar = this.host.parentElement?.querySelector<HTMLElement>('.inkstone-toolbar');
@@ -211,17 +278,19 @@ export class InkEngine {
   /** Start at a comfortable writing scale, with the first line below the pen palette. */
   fitWidth(): void {
     this.cancelPagePull();
-    this.zoom = clamp((this.size.x - (this.size.x < 620 ? 32 : 64)) / PAGE_WIDTH, 0.08, 2);
-    this.offset = { x: (this.size.x - PAGE_WIDTH * this.zoom) / 2, y: this.pageTop() };
-    this.fitMode = 'width'; this.viewportChanged();
+    const { width } = this.pageSize;
+    this.zoom = clamp((this.size.x - (this.size.x < 620 ? 32 : 64)) / width, 0.08, 2);
+    this.offset = { x: (this.size.x - width * this.zoom) / 2, y: this.pageTop() };
+    this.fitMode = 'width'; this.viewportChanged(false);
   }
   fit(): void {
     this.cancelPagePull();
     const top = this.pageTop();
+    const { width, height } = this.pageSize;
     const availableHeight = Math.max(1, this.size.y - top - 28);
-    this.zoom = clamp(Math.min((this.size.x - 56) / PAGE_WIDTH, availableHeight / PAGE_HEIGHT), 0.08, 2);
-    this.offset = { x: (this.size.x - PAGE_WIDTH * this.zoom) / 2, y: top + (availableHeight - PAGE_HEIGHT * this.zoom) / 2 };
-    this.fitMode = 'page'; this.viewportChanged();
+    this.zoom = clamp(Math.min((this.size.x - 56) / width, availableHeight / height), 0.08, 2);
+    this.offset = { x: (this.size.x - width * this.zoom) / 2, y: top + (availableHeight - height * this.zoom) / 2 };
+    this.fitMode = 'page'; this.viewportChanged(false);
   }
   zoomBy(factor: number): void {
     if (factor > 0 && Number.isFinite(factor)) this.zoomAt(factor, { x: this.size.x / 2, y: this.size.y / 2 });
@@ -233,10 +302,11 @@ export class InkEngine {
     this.searchHighlights = [];
     this.searchHighlightIndices = [];
     this.activeSearchHighlight = -1;
+    const { width, height } = this.pageSize;
     for (const [index, box] of boxes.slice(0, 1000).entries()) {
       if (![box.x, box.y, box.width, box.height].every(Number.isFinite) || box.width <= 0 || box.height <= 0) continue;
-      const x = clamp(box.x, 0, PAGE_WIDTH), y = clamp(box.y, 0, PAGE_HEIGHT);
-      const right = clamp(box.x + box.width, 0, PAGE_WIDTH), bottom = clamp(box.y + box.height, 0, PAGE_HEIGHT);
+      const x = clamp(box.x, 0, width), y = clamp(box.y, 0, height);
+      const right = clamp(box.x + box.width, 0, width), bottom = clamp(box.y + box.height, 0, height);
       if (right <= x || bottom <= y) continue;
       if (index === activeIndex) this.activeSearchHighlight = this.searchHighlights.length;
       this.searchHighlights.push({ x, y, width: right - x, height: bottom - y });
@@ -272,6 +342,8 @@ export class InkEngine {
     this.positionSearchHighlights();
   }
   private positionSearchHighlights(): void {
+    const { width, height } = this.pageSize;
+    this.searchLayer.style.width = `${width}px`; this.searchLayer.style.height = `${height}px`;
     this.searchLayer.style.transform = `translate(${this.offset.x}px, ${this.offset.y}px) scale(${this.zoom})`;
   }
 
@@ -280,27 +352,65 @@ export class InkEngine {
     this.finishSelection();
     if (!this.selected.size) return;
     const strokes = this.document.strokes.filter(stroke => !this.selected.has(stroke.id));
-    this.clearSelection(); this.change({ ...this.document, strokes });
+    const images = this.document.images?.filter(image => !this.selected.has(image.id));
+    this.clearSelection(); this.change({ ...this.document, strokes, ...(images ? { images } : {}) });
   }
   duplicateSelection(): void {
     this.finishSelection();
     const originals = this.document.strokes.filter(stroke => this.selected.has(stroke.id));
-    if (!originals.length) return;
+    const originalImages = (this.document.images ?? []).filter(image => this.selected.has(image.id));
+    if (!originals.length && !originalImages.length) return;
+    if ((this.document.images?.length ?? 0) + originalImages.length > MAX_PAGE_IMAGES) return;
     const box = this.selectionBox()!;
-    const dx = Math.max(-box.left, Math.min(24, PAGE_WIDTH - box.right));
-    const dy = Math.max(-box.top, Math.min(24, PAGE_HEIGHT - box.bottom));
+    const dx = Math.max(-box.left, Math.min(24, this.pageSize.width - box.right));
+    const dy = Math.max(-box.top, Math.min(24, this.pageSize.height - box.bottom));
     const copies = originals.map(stroke => ({ ...stroke, id: crypto.randomUUID(), points: stroke.points.map(p => ({ ...p, x: p.x + dx, y: p.y + dy })) }));
-    this.selected = new Set(copies.map(stroke => stroke.id));
-    this.change({ ...this.document, strokes: [...this.document.strokes, ...copies] });
-    this.options.onSelectionChange?.(copies.length);
+    const imageCopies = originalImages.map(image => ({ ...image, id: crypto.randomUUID(), x: image.x + dx, y: image.y + dy }));
+    this.selected = new Set([...copies, ...imageCopies].map(item => item.id));
+    this.change({ ...this.document, strokes: [...this.document.strokes, ...copies], ...(imageCopies.length ? { images: [...(this.document.images ?? []), ...imageCopies] } : {}) });
+    this.options.onSelectionChange?.(this.selected.size);
+  }
+  recolorSelection(color: string): void {
+    this.finishSelection();
+    if (!/^#[0-9a-f]{6}$/i.test(color)) return;
+    const strokes = this.document.strokes.map(stroke => this.selected.has(stroke.id) && stroke.color !== color ? { ...stroke, color } : stroke);
+    if (strokes.some((stroke, i) => stroke !== this.document.strokes[i])) this.change({ ...this.document, strokes });
+  }
+  resizeSelection(factor: number): void {
+    this.finishSelection();
+    const box = this.selectionBox();
+    if (!box || !Number.isFinite(factor) || factor <= 0) return;
+    const anchor = { x: (box.left + box.right) / 2, y: (box.top + box.bottom) / 2 };
+    this.change(this.scaleSelection(this.document, box, anchor, factor));
+  }
+  private scaleSelection(before: InkDocument, box: { left: number; right: number; top: number; bottom: number }, anchor: XY, factor: number): InkDocument {
+    const limits = [box.left < anchor.x ? anchor.x / (anchor.x - box.left) : Infinity,
+      box.right > anchor.x ? (this.pageSize.width - anchor.x) / (box.right - anchor.x) : Infinity,
+      box.top < anchor.y ? anchor.y / (anchor.y - box.top) : Infinity,
+      box.bottom > anchor.y ? (this.pageSize.height - anchor.y) / (box.bottom - anchor.y) : Infinity];
+    factor = Math.max(0.05, Math.min(factor, ...limits));
+    const transform = (p: XY) => ({ x: anchor.x + (p.x - anchor.x) * factor, y: anchor.y + (p.y - anchor.y) * factor });
+    return { ...before, strokes: before.strokes.map(stroke => this.selected.has(stroke.id) ? { ...stroke, width: clamp(stroke.width * factor, .5, 100), points: stroke.points.map(p => ({ ...p, ...transform(p) })) } : stroke),
+      ...(before.images ? { images: before.images.map(image => this.selected.has(image.id) ? { ...image, ...transform(image), width: image.width * factor, height: image.height * factor } : image) } : {}) };
+  }
+  addImage(image: PageImage): void {
+    this.flush();
+    if ((this.document.images?.length ?? 0) >= MAX_PAGE_IMAGES) throw new Error('This page has reached the image limit.');
+    if (!isImageSource(image.src) || !image.id || ![image.x, image.y, image.width, image.height].every(Number.isFinite) ||
+      image.x < 0 || image.y < 0 || image.width <= 0 || image.height <= 0 || image.x + image.width > this.pageSize.width || image.y + image.height > this.pageSize.height ||
+      this.document.images?.some(item => item.id === image.id)) throw new Error('The image has invalid data or page dimensions.');
+    this.change({ ...this.document, images: [...(this.document.images ?? []), { ...image }] });
   }
   private selectionBox() {
     const strokes = this.document.strokes.filter(stroke => this.selected.has(stroke.id));
-    if (!strokes.length) return null;
-    return strokes.reduce((box, stroke) => { for (const p of stroke.points) {
+    const images = (this.document.images ?? []).filter(image => this.selected.has(image.id));
+    if (!strokes.length && !images.length) return null;
+    const bounds = strokes.reduce((box, stroke) => { for (const p of stroke.points) {
       box.left = Math.min(box.left, p.x); box.right = Math.max(box.right, p.x);
       box.top = Math.min(box.top, p.y); box.bottom = Math.max(box.bottom, p.y);
     } return box; }, { left: Infinity, right: -Infinity, top: Infinity, bottom: -Infinity });
+    for (const image of images) { bounds.left = Math.min(bounds.left, image.x); bounds.top = Math.min(bounds.top, image.y); bounds.right = Math.max(bounds.right, image.x + image.width); bounds.bottom = Math.max(bounds.bottom, image.y + image.height); }
+    return bounds;
   }
   private finishSelection(cancel = false): void {
     if (this.drag) {
@@ -309,7 +419,10 @@ export class InkEngine {
       else if (this.document !== before) { const next = this.document; this.document = before; this.change(next); }
     }
     if (this.lasso) {
-      if (!cancel) this.selected = new Set(enclosedStrokes(this.document.strokes, this.lasso.points));
+      if (!cancel) {
+        const polygon = this.lasso.points;
+        this.selected = new Set([...enclosedStrokes(this.document.strokes, polygon), ...(this.document.images ?? []).filter(image => polygon.length >= 3 && [{ x: image.x, y: image.y }, { x: image.x + image.width, y: image.y }, { x: image.x, y: image.y + image.height }, { x: image.x + image.width, y: image.y + image.height }].every(p => pointInPolygon(p, polygon))).map(image => image.id)]);
+      }
       this.lasso = null; this.options.onSelectionChange?.(this.selected.size); this.redraw();
     }
   }
@@ -320,7 +433,10 @@ export class InkEngine {
       const context = this.liveContext;
       context.strokeStyle = '#4b79db'; context.lineWidth = 1.5 / this.zoom; context.setLineDash([6 / this.zoom, 4 / this.zoom]);
       const box = this.selectionBox();
-      if (box) { const pad = 6 / this.zoom; context.strokeRect(box.left-pad, box.top-pad, box.right-box.left+pad*2, box.bottom-box.top+pad*2); }
+      if (box) { const pad = 6 / this.zoom; context.strokeRect(box.left-pad, box.top-pad, box.right-box.left+pad*2, box.bottom-box.top+pad*2);
+        context.setLineDash([]); context.fillStyle = '#ffffff';
+        for (const x of [box.left, box.right]) for (const y of [box.top, box.bottom]) { const r = 4 / this.zoom; context.fillRect(x-r, y-r, r*2, r*2); context.strokeRect(x-r, y-r, r*2, r*2); }
+      }
       if (this.lasso?.points.length) {
         context.beginPath(); context.moveTo(this.lasso.points[0].x, this.lasso.points[0].y);
         for (const p of this.lasso.points.slice(1)) context.lineTo(p.x, p.y);
@@ -330,10 +446,23 @@ export class InkEngine {
     });
   }
   private change(next: InkDocument): void {
-    this.undoStack.push(this.document);
+    const previous = this.document;
+    this.undoStack.push({ page: this.document, counterpart: next });
     if (this.undoStack.length > 100) this.undoStack.shift();
-    this.redoStack = []; this.document = next;
+    this.redoStack = []; this.document = next; this.refreshPageFormat(previous);
     this.redraw(); this.options.onChange(this.document);
+  }
+  private refreshPageFormat(previous: InkDocument): void {
+    this.pages[this.pageIndex] = this.document;
+    const before = pageDimensions(previous), after = this.pageSize;
+    if (before.width === after.width && before.height === after.height) return;
+    this.cancelPagePull(); this.setSearchHighlights([]);
+    if (this.fitMode === 'width') this.fitWidth();
+    else if (this.fitMode === 'page') this.fit();
+    else {
+      this.offset.x += (before.width - after.width) / 2 * this.zoom;
+      this.viewportChanged(false);
+    }
   }
 
   private resize(): void {
@@ -364,11 +493,12 @@ export class InkEngine {
     context.clearRect(0, 0, context.canvas.width, context.canvas.height);
   }
   private transform(context: CanvasRenderingContext2D): void {
-    context.setTransform(this.zoom * this.dpr, 0, 0, this.zoom * this.dpr, this.offset.x * this.dpr, (this.offset.y + this.renderOffset) * this.dpr);
+    context.setTransform(this.zoom * this.dpr, 0, 0, this.zoom * this.dpr, (this.offset.x + this.renderOffset.x) * this.dpr, (this.offset.y + this.renderOffset.y) * this.dpr);
   }
   private clipped(context: CanvasRenderingContext2D, draw: () => void): void {
     context.save(); this.transform(context);
-    context.beginPath(); context.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT); context.clip();
+    const { width, height } = pageDimensions(this.renderPage ?? this.document);
+    context.beginPath(); context.rect(0, 0, width, height); context.clip();
     draw(); context.restore();
   }
   private drawSegment(context: CanvasRenderingContext2D, stroke: Stroke, point: Point, previous?: Point): void {
@@ -398,22 +528,9 @@ export class InkEngine {
   private paper(page: InkDocument): void {
     const context = this.baseContext;
     this.transform(context);
-    context.fillStyle = '#faf9ef'; context.fillRect(0, 0, PAGE_WIDTH, PAGE_HEIGHT);
-    context.strokeStyle = '#d8dcd8'; context.fillStyle = '#cbd2cc'; context.lineWidth = 1;
-    const paper = page.paper;
-    if (paper === 'dots') {
-      context.beginPath();
-      for (let y = 40; y < PAGE_HEIGHT; y += 40) for (let x = 40; x < PAGE_WIDTH; x += 40) {
-        context.moveTo(x + 1.4, y); context.arc(x, y, 1.4, 0, Math.PI * 2);
-      }
-      context.fill();
-    } else if (paper === 'ruled' || paper === 'grid') {
-      context.beginPath();
-      for (let y = paper === 'ruled' ? 100 : 40; y < PAGE_HEIGHT; y += 40) { context.moveTo(0, y); context.lineTo(PAGE_WIDTH, y); }
-      if (paper === 'grid') for (let x = 40; x < PAGE_WIDTH; x += 40) { context.moveTo(x, 0); context.lineTo(x, PAGE_HEIGHT); }
-      context.stroke();
-    }
+    drawPaper(context, page.paper, page);
   }
+
   private composite(context: CanvasRenderingContext2D, canvas: HTMLCanvasElement, alpha: number): void {
     context.save(); context.setTransform(1, 0, 0, 1, 0, 0); context.globalAlpha = alpha;
     context.drawImage(canvas, 0, 0); context.restore();
@@ -421,13 +538,18 @@ export class InkEngine {
   private redraw(): void {
     this.positionSearchHighlights();
     this.clear(this.baseContext);
-    const worldY = this.offset.y - this.pageIndex * PAGE_STRIDE * this.zoom;
-    const first = clamp(Math.floor(-worldY / (PAGE_STRIDE * this.zoom)), 0, this.pages.length - 1);
-    const last = clamp(Math.floor((this.size.y - worldY) / (PAGE_STRIDE * this.zoom)), 0, this.pages.length - 1);
-    for (let index = first; index <= last; index++) {
-      this.renderOffset = (index - this.pageIndex) * PAGE_STRIDE * this.zoom;
-      const page = index === this.pageIndex ? this.document : this.pages[index];
+    const layout = this.pageLayout(), active = layout.pages[this.pageIndex];
+    for (const entry of layout.pages) {
+      const y = this.offset.y + (entry.top - active.top) * this.zoom;
+      if (y > this.size.y || y + entry.height * this.zoom < 0) continue;
+      this.renderOffset = { x: (active.width - entry.width) / 2 * this.zoom, y: (entry.top - active.top) * this.zoom };
+      const page = entry.page; this.renderPage = page;
       this.paper(page);
+      for (const item of page.images ?? []) {
+        let image = this.imageCache.get(item.src);
+        if (!image) { image = new Image(); this.imageCache.set(item.src, image); image.onload = () => this.scheduleRedraw(); image.src = item.src; }
+        if (image.complete && image.naturalWidth) this.clipped(this.baseContext, () => this.baseContext.drawImage(image!, item.x, item.y, item.width, item.height));
+      }
       for (const stroke of page.strokes) {
         if (!this.visible(stroke)) continue;
         if (stroke.tool === 'highlighter') {
@@ -436,7 +558,7 @@ export class InkEngine {
         } else this.drawStroke(this.baseContext, stroke);
       }
     }
-    this.renderOffset = 0;
+    this.renderOffset = { x: 0, y: 0 }; this.renderPage = null;
     this.clear(this.liveContext);
     if (this.active) this.drawStroke(this.liveContext, this.active.stroke);
     else this.drawSelection();
@@ -459,8 +581,8 @@ export class InkEngine {
   }
   private visible(stroke: Stroke): boolean {
     const bounds = this.strokeBounds(stroke);
-    return bounds.right * this.zoom + this.offset.x >= 0 && bounds.left * this.zoom + this.offset.x <= this.size.x &&
-      bounds.bottom * this.zoom + this.offset.y + this.renderOffset >= 0 && bounds.top * this.zoom + this.offset.y + this.renderOffset <= this.size.y;
+    return bounds.right * this.zoom + this.offset.x + this.renderOffset.x >= 0 && bounds.left * this.zoom + this.offset.x + this.renderOffset.x <= this.size.x &&
+      bounds.bottom * this.zoom + this.offset.y + this.renderOffset.y >= 0 && bounds.top * this.zoom + this.offset.y + this.renderOffset.y <= this.size.y;
   }
   private positionEraserCursor(): void {
     const visible = this.tool === 'eraser' && this.hover !== null;
@@ -472,17 +594,19 @@ export class InkEngine {
   }
   private updateCursor(): void { this.host.style.cursor = this.tool === 'hand' ? 'grab' : this.tool === 'eraser' ? 'none' : 'crosshair'; this.positionEraserCursor(); }
   private viewportBounds() {
-    const width = PAGE_WIDTH * this.zoom, height = (this.pages.length * PAGE_STRIDE - PAGE_GAP) * this.zoom;
+    const layout = this.pageLayout(), active = layout.pages[this.pageIndex];
+    const width = layout.width * this.zoom, height = layout.height * this.zoom;
+    const pageX = (layout.width - active.width) / 2 * this.zoom, pageY = active.top * this.zoom;
     const margin = Math.min(28, this.size.x / 4);
     const top = Math.min(this.pageTop(), Math.max(0, this.size.y - 48));
     const bottom = Math.max(top + 1, this.size.y - 28);
     const centerX = (this.size.x - width) / 2;
     const centerY = top + (bottom - top - height) / 2;
     return {
-      left: width <= this.size.x - margin * 2 ? centerX : this.size.x - margin - width,
-      right: width <= this.size.x - margin * 2 ? centerX : margin,
-      bottom: (height <= bottom - top ? centerY : bottom - height) + this.pageIndex * PAGE_STRIDE * this.zoom,
-      top: (height <= bottom - top ? centerY : top) + this.pageIndex * PAGE_STRIDE * this.zoom,
+      left: (width <= this.size.x - margin * 2 ? centerX : this.size.x - margin - width) + pageX,
+      right: (width <= this.size.x - margin * 2 ? centerX : margin) + pageX,
+      bottom: (height <= bottom - top ? centerY : bottom - height) + pageY,
+      top: (height <= bottom - top ? centerY : top) + pageY,
     };
   }
   private clampViewport(): void {
@@ -508,17 +632,18 @@ export class InkEngine {
       pull.rawY = Math.min(bounds.top, pull.rawY + delta.y);
       this.offset.y = pull.rawY;
       const upward = pull.origin.y - local.y;
-      const deliberate = upward > 10 && upward > Math.abs(local.x - pull.origin.x);
-      this.setPagePullProgress(deliberate ? clamp((bounds.bottom - pull.rawY) / 96, 0, 1) : 0);
+      // Once upward intent is clear, lateral finger drift must not blink the
+      // affordance off. Reversing still unwinds the same raw distance directly.
+      if (upward > 10 && upward > Math.abs(local.x - pull.origin.x)) pull.vertical = true;
+      this.setPagePullProgress(pull.vertical ? clamp((bounds.bottom - pull.rawY) / 96, 0, 1) : 0);
     } else this.offset.y += delta.y;
     this.viewportChanged();
   }
-  private viewportChanged(): void {
+  private viewportChanged(activate = true): void {
     this.clampViewport();
-    if (!(this.active || this.erase || this.lasso || this.drag)) {
+    if (activate && !(this.active || this.erase || this.lasso || this.drag)) {
       const center = (this.pageTop() + this.size.y) / 2;
-      const index = clamp(this.pageIndex + Math.floor((center - this.offset.y) / (PAGE_STRIDE * this.zoom)), 0, this.pages.length - 1);
-      this.activatePage(index);
+      this.activatePage(this.pageAt(center));
     }
     this.positionSearchHighlights(); this.positionEraserCursor(); this.scheduleRedraw(); this.options.onViewportChange?.(this.zoom);
   }
@@ -532,7 +657,7 @@ export class InkEngine {
     const rect = this.host.getBoundingClientRect(); return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   }
   private toPage(point: XY): XY { return { x: (point.x - this.offset.x) / this.zoom, y: (point.y - this.offset.y) / this.zoom }; }
-  private inside(point: XY): boolean { return point.x >= 0 && point.y >= 0 && point.x <= PAGE_WIDTH && point.y <= PAGE_HEIGHT; }
+  private inside(point: XY): boolean { return point.x >= 0 && point.y >= 0 && point.x <= this.pageSize.width && point.y <= this.pageSize.height; }
   private capture(event: PointerEvent): void { try { this.host.setPointerCapture(event.pointerId); } catch { /* Detached hosts cannot capture. */ } }
   private sample(event: PointerEvent, rect?: DOMRect): Point {
     const point = this.toPage(rect ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : this.local(event));
@@ -569,11 +694,10 @@ export class InkEngine {
     if (this.active || this.erase || this.pan || this.lasso || this.drag) return;
     if (this.tool === 'hand' || (event.pointerType === 'touch' && !this.fingerDrawing)) {
       if (event.pointerType !== 'touch') this.pan = { pointerId: event.pointerId, pointerType: event.pointerType, last: local };
-      if (event.pointerType === 'touch' || (event.pointerType === 'mouse' && !this.touches.size)) this.pagePull = { pointerId: event.pointerId, origin: local, rawY: this.offset.y };
+      if (event.pointerType === 'touch' || (event.pointerType === 'mouse' && !this.touches.size)) this.pagePull = { pointerId: event.pointerId, origin: local, rawY: this.offset.y, vertical: false };
       return;
     }
-    const index = this.pageIndex + Math.floor((local.y - this.offset.y) / (PAGE_STRIDE * this.zoom));
-    if (index >= 0 && index < this.pages.length) this.activatePage(index);
+    this.activatePage(this.pageAt(local.y));
     const point = this.sample(event);
     if (!this.inside(point)) return;
     if (this.tool === 'eraser' || event.button === 5) {
@@ -582,12 +706,14 @@ export class InkEngine {
     if (this.tool === 'lasso') {
       const box = this.selectionBox();
       if (box && point.x >= box.left - 8 / this.zoom && point.x <= box.right + 8 / this.zoom && point.y >= box.top - 8 / this.zoom && point.y <= box.bottom + 8 / this.zoom) {
-        this.drag = { pointerId: event.pointerId, origin: point, before: this.document, dx: 0, dy: 0 };
+        const corner = [{ x: box.left, y: box.top }, { x: box.right, y: box.top }, { x: box.left, y: box.bottom }, { x: box.right, y: box.bottom }].find(p => distance(point, p) <= 10 / this.zoom);
+        this.drag = { pointerId: event.pointerId, origin: point, before: this.document, dx: 0, dy: 0, ...(corner ? { box, anchor: { x: corner.x === box.left ? box.right : box.left, y: corner.y === box.top ? box.bottom : box.top } } : {}) };
       } else { this.clearSelection(); this.lasso = { pointerId: event.pointerId, points: [point] }; this.redraw(); }
       return;
     }
     const tool = this.tool === 'highlighter'  ? 'highlighter' : 'pen';
     const stroke: Stroke = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`, tool, color: this.color, width: this.width, points: [point] };
+    this.shapeStart = this.tool === 'shape' && this.shapeMode !== 'auto' ? point : null;
     this.active = { pointerId: event.pointerId, stroke };
     this.live.style.opacity = tool === 'highlighter' ? '0.28' : '1';
     this.clear(this.liveContext);
@@ -604,17 +730,28 @@ export class InkEngine {
     }
     if (this.drag?.pointerId === event.pointerId) {
       const point = this.sample(event), drag = this.drag;
+      if (drag.anchor && drag.box) {
+        const vx = drag.origin.x - drag.anchor.x, vy = drag.origin.y - drag.anchor.y;
+        const factor = ((point.x - drag.anchor.x) * vx + (point.y - drag.anchor.y) * vy) / (vx * vx + vy * vy || 1);
+        this.document = this.scaleSelection(drag.before, drag.box, drag.anchor, factor); this.scheduleRedraw(); return;
+      }
       const current = this.document; this.document = drag.before;
       const box = this.selectionBox()!; this.document = current;
-      const dx = clamp(point.x - drag.origin.x, -box.left, PAGE_WIDTH-box.right);
-      const dy = clamp(point.y - drag.origin.y, -box.top, PAGE_HEIGHT-box.bottom);
+      const dx = clamp(point.x - drag.origin.x, -box.left, this.pageSize.width-box.right);
+      const dy = clamp(point.y - drag.origin.y, -box.top, this.pageSize.height-box.bottom);
       if (dx === drag.dx && dy === drag.dy) return;
       drag.dx = dx; drag.dy = dy;
-      this.document = { ...drag.before, strokes: drag.before.strokes.map(stroke => this.selected.has(stroke.id) ? { ...stroke, points: stroke.points.map(p => ({ ...p, x: p.x+dx, y: p.y+dy })) } : stroke) };
+      this.document = { ...drag.before, strokes: drag.before.strokes.map(stroke => this.selected.has(stroke.id) ? { ...stroke, points: stroke.points.map(p => ({ ...p, x: p.x+dx, y: p.y+dy })) } : stroke), ...(drag.before.images ? { images: drag.before.images.map(image => this.selected.has(image.id) ? { ...image, x: image.x + dx, y: image.y + dy } : image) } : {}) };
       this.scheduleRedraw(); return;
     }
     if (this.active?.pointerId === event.pointerId) {
       if (this.touches.has(event.pointerId)) this.touches.set(event.pointerId, this.local(event));
+      if (this.shapeStart && this.shapeMode !== 'auto') {
+        const { width, height } = this.pageSize;
+        const end = this.sample(event); end.x = clamp(end.x, 0, width); end.y = clamp(end.y, 0, height);
+        this.active.stroke.points = createShape(this.shapeMode, this.shapeStart, end).map(p => ({ ...p, x: clamp(p.x, 0, width), y: clamp(p.y, 0, height) }));
+        this.clear(this.liveContext); this.drawStroke(this.liveContext, this.active.stroke); return;
+      }
       let samples: PointerEvent[] = [];
       try { samples = event.getCoalescedEvents?.() ?? []; } catch { /* Older WebKit may expose an unsupported method. */ }
       if (!samples.length) samples = [event];
@@ -686,10 +823,10 @@ export class InkEngine {
   };
   private finishActive(convertShape = false): void {
     if (!this.active) return;
-    let stroke = this.active.stroke; this.active = null;
-    const shape = convertShape && this.tool === 'shape' ? recognizeShape(stroke.points) : null;
+    let stroke = this.active.stroke; this.active = null; this.shapeStart = null;
+    const shape = convertShape && this.tool === 'shape' && this.shapeMode === 'auto' ? recognizeShape(stroke.points) : null;
     if (shape) { stroke = { ...stroke, points: shape }; this.clear(this.liveContext); this.drawStroke(this.liveContext, stroke); }
-    this.undoStack.push(this.document); if (this.undoStack.length > 100) this.undoStack.shift(); this.redoStack = [];
+    this.undoStack.push({ page: this.document, counterpart: this.document }); if (this.undoStack.length > 100) this.undoStack.shift(); this.redoStack = [];
     this.document = { ...this.document, strokes: [...this.document.strokes, stroke] };
     // Commit the live layer without replaying historical strokes.
     this.composite(this.baseContext, this.live, stroke.tool === 'highlighter' ? 0.28 : 1);
@@ -715,7 +852,7 @@ export class InkEngine {
     if (!this.erase) return;
     const before = this.erase.before; this.erase = null;
     if (before === this.document) return;
-    this.undoStack.push(before); if (this.undoStack.length > 100) this.undoStack.shift(); this.redoStack = [];
+    this.undoStack.push({ page: before, counterpart: this.document }); if (this.undoStack.length > 100) this.undoStack.shift(); this.redoStack = [];
     this.options.onChange(this.document);
   }
   private contextMenu = (event: Event): void => event.preventDefault();
@@ -728,16 +865,21 @@ export class InkEngine {
     const atBottom=Math.abs(this.offset.y-this.viewportBounds().bottom)<1;
     if(!this.wheelPull)this.wheelPull={distance:0,samples:0,eligible:atBottom && Date.now()>=this.wheelCooldown};
     const pull=this.wheelPull;
+    let scrollY=dy;
     // A scroll that merely reaches the end cannot add a page through momentum.
     // Start a fresh, mostly vertical scroll at the bottom; a pause acts as release.
-    if(Math.abs(dx)>=Math.abs(dy)||Math.abs(dy)>500)pull.eligible=false;
+    if(Math.abs(dx)>=Math.abs(dy)||Math.abs(dy)>500||(!atBottom && pull.distance===0))pull.eligible=false;
     if(pull.eligible) {
-      pull.distance=Math.max(0,pull.distance+Math.max(-60,Math.min(60,dy)));
+      const previousDistance=pull.distance;
+      pull.distance=Math.max(0,pull.distance+Math.min(60,dy));
+      // Reverse through the accumulated overscroll before moving the page.
+      // This mirrors touch panning and keeps progress attached to the boundary.
+      if(dy<0)scrollY=Math.min(0,dy+previousDistance);
       if(dy>0)pull.samples++;
       this.setPagePullProgress(clamp(pull.distance/180,0,1));
     }
     if(!pull.eligible)this.setPagePullProgress(0);
-    this.fitMode='manual';this.offset.x-=dx;this.offset.y-=dy;this.viewportChanged();
+    this.fitMode='manual';this.offset.x-=dx;this.offset.y-=scrollY;this.viewportChanged();
     clearTimeout(this.wheelPullTimer);
     this.wheelPullTimer=setTimeout(()=>{
       const advance=pull.eligible && pull.samples>=3 && this.pagePullProgress>=1 && !this.disposed;
@@ -747,21 +889,16 @@ export class InkEngine {
   };
 
   exportSvg(): string {
-    this.finishActive(); this.finishErase();
+    this.flush();
     const n = (value: number) => Number(value.toFixed(2));
-    const parts = [`<svg xmlns="http://www.w3.org/2000/svg" width="${PAGE_WIDTH}" height="${PAGE_HEIGHT}" viewBox="0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}">`,
-      '<defs><clipPath id="page"><rect width="1400" height="1900"/></clipPath></defs><rect width="1400" height="1900" fill="#faf9ef"/>'];
-    if (this.document.paper === 'dots') {
-      parts.push('<g fill="#cbd2cc">');
-      for (let y = 40; y < PAGE_HEIGHT; y += 40) for (let x = 40; x < PAGE_WIDTH; x += 40) parts.push(`<circle cx="${x}" cy="${y}" r="1.4"/>`);
-      parts.push('</g>');
-    } else if (this.document.paper === 'grid' || this.document.paper === 'ruled') {
-      parts.push('<g stroke="#d8dcd8" stroke-width="1">');
-      for (let y = this.document.paper === 'ruled' ? 100 : 40; y < PAGE_HEIGHT; y += 40) parts.push(`<path d="M0 ${y}H${PAGE_WIDTH}"/>`);
-      if (this.document.paper === 'grid') for (let x = 40; x < PAGE_WIDTH; x += 40) parts.push(`<path d="M${x} 0V${PAGE_HEIGHT}"/>`);
-      parts.push('</g>');
-    }
+    const { width, height } = this.pageSize;
+    const parts = [`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+      `<defs><clipPath id="page"><rect width="${width}" height="${height}"/></clipPath></defs>`];
+    parts.push(paperSvg(this.document.paper, this.document));
     parts.push('<g clip-path="url(#page)">');
+    for (const image of this.document.images ?? []) {
+      if (isImageSource(image.src)) parts.push(`<image x="${n(image.x)}" y="${n(image.y)}" width="${n(image.width)}" height="${n(image.height)}" href="${image.src}"/>`);
+    }
     for (const stroke of this.document.strokes) {
       // Only validated six-digit colors enter the SVG attribute.
       const color = /^#[0-9a-f]{6}$/i.test(stroke.color) ? stroke.color : '#243247';
@@ -785,6 +922,7 @@ export class InkEngine {
     this.abort.abort(); this.observer.disconnect(); if (this.frame) cancelAnimationFrame(this.frame);
     this.base.remove(); this.live.remove(); this.eraserCursor.remove(); this.histories.clear(); this.searchLayer.replaceChildren(); this.searchLayer.remove(); this.searchHighlights = []; this.searchHighlightIndices = [];
     for (const canvas of [this.base, this.live, this.scratch]) canvas.width = canvas.height = 1;
+    for (const image of this.imageCache.values()) image.onload = null; this.imageCache.clear();
     this.touches.clear();
   }
 }

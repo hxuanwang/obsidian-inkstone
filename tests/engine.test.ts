@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPage as createDocument, type InkPage as InkDocument } from '../src/model';
+import { createPage as createDocument, pageDimensions, parseDocument, type InkPage as InkDocument } from '../src/model';
 import { InkEngine, pointSegmentDistance, PAGE_GAP, PAGE_HEIGHT } from '../src/ink-engine';
 
 const note = (): InkDocument => ({
@@ -18,9 +18,14 @@ test('eraser distance covers dots, segment interiors, and endpoints', () => {
 class CanvasContext {
   arcs = 0;
   composites = 0;
+  fillStyle = '';
+  fills: { width: number; height: number; color: string }[] = [];
+  clips: { width: number; height: number }[] = [];
   constructor(readonly canvas: Canvas) {}
-  setTransform() {} clearRect() {} save() {} restore() {} beginPath() {} rect() {} clip() {}
-  setLineDash() {} strokeRect() {} moveTo() {} lineTo() {} closePath() {} fill() {} fillRect() {} stroke() {}
+  setTransform() {} clearRect() {} save() {} restore() {} beginPath() {} clip() {}
+  rect(_x: number, _y: number, width: number, height: number) { this.clips.push({ width, height }); }
+  setLineDash() {} strokeRect() {} moveTo() {} lineTo() {} closePath() {} fill() {} stroke() {} fillText() {}
+  fillRect(_x: number, _y: number, width: number, height: number) { this.fills.push({ width, height, color: this.fillStyle }); }
   arc() { this.arcs++; }
   drawImage() { this.composites++; }
 }
@@ -64,6 +69,7 @@ function withEngine(run: (state: {
   let sequence = 0;
   const frames = new Map<number, FrameRequestCallback>();
   install('document', { createElement: (tag: string) => tag === 'canvas' ? new Canvas() : new Layer() });
+  install('Image', class { complete = true; naturalWidth = 100; src = ''; onload = null; });
   install('window', { devicePixelRatio: 2 });
   let onResize = () => {};
   install('ResizeObserver', class { constructor(callback: () => void) { onResize = callback; } observe() {} disconnect() {} });
@@ -397,6 +403,19 @@ test('pull counts only travel beyond the bottom and ignores predominantly horizo
   });
 });
 
+test('a deliberate vertical pull stays continuous through lateral finger drift', () => {
+  withEngine(({ host, pointer, pulls, advances }) => {
+    wheelTo(host, 100000);
+    pointer('pointerdown', 0, 0, contact(500));
+    pointer('pointermove', 0, 0, contact(452));
+    assert.equal(pulls.at(-1), 0.5);
+    pointer('pointermove', 0, 0, contact(440, 'touch', 2, 800));
+    assert.equal(pulls.at(-1), 60 / 96, 'lateral drift does not reset progress');
+    pointer('pointerup', 0, 0, contact(480, 'touch', 2, 800));
+    assert.equal(advances(), 0, 'reversing still disarms the pull');
+  });
+});
+
 test('pinch cancels an armed pull and its surviving finger cannot advance', () => {
   withEngine(({ host, pointer, advances, pulls }) => {
     wheelTo(host, 100000);
@@ -527,6 +546,24 @@ test('reversing a trackpad pull or interrupting it with Pencil cancels page crea
   });
 });
 
+test('trackpad reversal unwinds progress before scrolling away from the bottom', t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  withEngine(({ host, pulls, advances }) => {
+    wheelTo(host, 100000); t.mock.timers.tick(230);
+    const bottom = viewport(host);
+    for (let i = 0; i < 3; i++) wheelTo(host, 60);
+    wheelTo(host, -120);
+    assert.equal(pulls.at(-1), 1 / 3);
+    assert.deepEqual(viewport(host), bottom, 'remaining pull keeps the page at its boundary');
+    wheelTo(host, -80);
+    assert.equal(pulls.at(-1), 0);
+    assert.equal(viewport(host).y, bottom.y + 20, 'only unused reverse distance scrolls the page');
+    for (let i = 0; i < 4; i++) wheelTo(host, 60);
+    assert.equal(pulls.at(-1), 0, 'returning to the edge needs a fresh gesture');
+    t.mock.timers.tick(230); assert.equal(advances(), 0);
+  });
+});
+
 
 test('continuous scrolling crosses page seams without changing world position or pulling', () => {
   const pages = [createDocument(), createDocument(), createDocument()];
@@ -607,4 +644,211 @@ test('finger panning scrolls existing pages and only pulls beyond the last page'
     pointer('pointerup', 0, 0, contact(404));
     assert.equal(advances(), 1);
   }, pages[0]);
+});
+
+test('lasso recoloring and resizing preserve pressure and are separately undoable', () => {
+  withEngine(({ engine, pointer }) => {
+    pointer('pointerdown', 200, 300, { pressure: .3 }); pointer('pointerup', 400, 400, { pressure: .8 });
+    const original = engine.getDocument().strokes[0];
+    engine.setTool('lasso');
+    pointer('pointerdown', 180, 280); pointer('pointermove', 420, 280); pointer('pointermove', 420, 420); pointer('pointermove', 180, 420); pointer('pointerup', 180, 280);
+    engine.recolorSelection('#ff0000'); engine.resizeSelection(2);
+    const changed = engine.getDocument().strokes[0];
+    assert.equal(changed.color, '#ff0000');
+    assert.ok(Math.abs(changed.points[0].x - 100) < 1e-6);
+    assert.ok(Math.abs(changed.points[1].y - 450) < 1e-6);
+    assert.deepEqual(changed.points.map(p => p.pressure), original.points.map(p => p.pressure));
+    engine.undo(); assert.equal(engine.getDocument().strokes[0].color, '#ff0000');
+    assert.deepEqual(engine.getDocument().strokes[0].points, original.points);
+    engine.undo(); assert.deepEqual(engine.getDocument().strokes[0], original);
+  });
+});
+
+test('corner resize is one transaction and cancellation restores the selection', () => {
+  withEngine(({ engine, pointer, changes }) => {
+    pointer('pointerdown', 200, 300); pointer('pointerup', 400, 400);
+    engine.setTool('lasso');
+    pointer('pointerdown', 180, 280); pointer('pointermove', 420, 280); pointer('pointermove', 420, 420); pointer('pointermove', 180, 420); pointer('pointerup', 180, 280);
+    const before = engine.getDocument();
+    pointer('pointerdown', 400, 400); pointer('pointermove', 600, 500); pointer('pointercancel', 600, 500);
+    assert.equal(engine.getDocument(), before);
+    pointer('pointerdown', 400, 400); pointer('pointermove', 500, 450); pointer('pointerup', 600, 500);
+    assert.equal(changes.length, 2);
+    assert.ok(Math.abs(engine.getDocument().strokes[0].points[1].x - 600) < 1e-6);
+    engine.undo(); assert.equal(engine.getDocument(), before);
+  });
+});
+
+test('explicit shapes preview exact geometry and commit with undo', () => {
+  for (const mode of ['rectangle', 'ellipse', 'line', 'arrow'] as const) withEngine(({ engine, pointer, changes }) => {
+    engine.setTool('shape'); engine.setShapeMode(mode);
+    pointer('pointerdown', 200, 300); pointer('pointermove', 250, 600); pointer('pointerup', 400, 400);
+    const stroke = engine.getDocument().strokes[0];
+    assert.equal(stroke.points.length, mode === 'ellipse' ? 97 : mode === 'line' ? 2 : 5);
+    assert.ok(stroke.points.every(p => p.y < 450), 'preview samples must not survive in committed shape');
+    assert.equal(changes.length, 1); engine.undo(); assert.equal(engine.getDocument().strokes.length, 0);
+  });
+});
+
+test('inserted images can be selected, resized, duplicated, deleted and exported', () => {
+  withEngine(({ engine, pointer }) => {
+    const src = 'data:image/png;base64,aGVsbG8=';
+    engine.addImage({ id: 'image-1', src, x: 200, y: 300, width: 200, height: 100 });
+    assert.ok(engine.exportSvg().includes(`href="${src}"`));
+    engine.setTool('lasso');
+    pointer('pointerdown', 180, 280); pointer('pointermove', 420, 280); pointer('pointermove', 420, 420); pointer('pointermove', 180, 420); pointer('pointerup', 180, 280);
+    engine.resizeSelection(2); assert.equal(engine.getDocument().images![0].width, 400);
+    engine.duplicateSelection(); assert.equal(engine.getDocument().images!.length, 2);
+    engine.deleteSelection(); assert.equal(engine.getDocument().images!.length, 1);
+    engine.undo(); assert.equal(engine.getDocument().images!.length, 2);
+  });
+});
+
+test('format changes resize content in one undo transaction and export the actual paper', () => {
+  const page = note();
+  page.textBoxes = [{ id: 'text', x: 900, y: 1600, width: 300, height: 200, fontSize: 28, color: '#123456', text: 'Keep this note' }];
+  page.images = [{ id: 'image', x: 800, y: 1300, width: 500, height: 500, src: 'data:image/png;base64,aGVsbG8=' }];
+  withEngine(({ engine, host, changes, flush }) => {
+    const beforeZoom = engine.getViewport().zoom;
+    engine.setPageFormat({ pageSize: 'a4', orientation: 'landscape', paperColor: '#e7f0e9', paper: 'cornell' });
+    flush();
+    const after = engine.getDocument();
+    assert.equal(changes.length, 1);
+    assert.deepEqual(pageDimensions(after), { width: 1980, height: 1400 });
+    assert.ok(engine.getViewport().zoom < beforeZoom, 'fit width follows the wider paper');
+    assert.ok(after.strokes[0].points[0].x < page.strokes[0].points[0].x);
+    assert.equal(after.textBoxes![0].text, 'Keep this note');
+    assert.equal(after.images![0].src, page.images![0].src);
+    assert.deepEqual(parseDocument(JSON.stringify({ version: 2, pages: [after] })).pages[0], after);
+    const svg = engine.exportSvg();
+    assert.match(svg, /width="1980" height="1400" viewBox="0 0 1980 1400"/);
+    assert.match(svg, /clipPath id="page"><rect width="1980" height="1400"/);
+    assert.match(svg, /fill="#e7f0e9"/);
+    assert.ok(host.canvases[0].context.fills.some(fill => fill.width === 1980 && fill.height === 1400 && fill.color === '#e7f0e9'));
+    assert.equal(host.layers[0].style.width, '1980px'); assert.equal(host.layers[0].style.height, '1400px');
+    engine.undo(); assert.deepEqual(engine.getDocument(), page); assert.equal(engine.getViewport().zoom, beforeZoom);
+    engine.redo(); assert.deepEqual(engine.getDocument(), after);
+    const saves = changes.length;
+    engine.setPageFormat({ pageSize: 'a4', orientation: 'landscape', paperColor: '#e7f0e9', paper: 'cornell' });
+    assert.equal(changes.length, saves, 'reapplying identical paper does not create history');
+  }, page);
+});
+
+test('mixed page sizes scroll continuously using cumulative heights and a shared horizontal center', () => {
+  const pages: InkDocument[] = [createDocument(), { ...createDocument(), pageSize: 'a4', orientation: 'landscape', paperColor: '#e8f0ff' }, { ...createDocument(), pageSize: 'letter' }];
+  withEngine(({ engine, host, activePages, pulls, flush }) => {
+    engine.setPages(pages);
+    const first = engine.getViewport();
+    wheelTo(host, 1600);
+    const second = engine.getViewport();
+    assert.equal(engine.getDocument().id, pages[1].id);
+    assert.ok(Math.abs(second.y - (1900 + PAGE_GAP) * second.zoom - (first.y - 1600)) < 1e-6);
+    assert.ok(Math.abs(second.x + 1980 / 2 * second.zoom - (first.x + 1400 / 2 * first.zoom)) < 1e-6);
+    wheelTo(host, 1000);
+    const third = engine.getViewport();
+    assert.equal(engine.getDocument().id, pages[2].id);
+    assert.ok(Math.abs(third.y - (1900 + 1400 + PAGE_GAP * 2) * third.zoom - (first.y - 2600)) < 1e-6);
+    assert.equal(third.x, first.x);
+    wheelTo(host, -2600);
+    assert.equal(engine.getDocument().id, pages[0].id);
+    assert.ok(Math.abs(engine.getViewport().y - first.y) < 1e-6);
+    assert.deepEqual(activePages.map(page => page.id), [pages[1].id, pages[2].id, pages[0].id]);
+    assert.deepEqual(pulls, []);
+    host.canvases[0].context.fills = [];
+    wheelTo(host, 2100); flush();
+    const fills = host.canvases[0].context.fills;
+    assert.ok(fills.some(fill => fill.width === 1980 && fill.height === 1400 && fill.color === '#e8f0ff'));
+    assert.ok(fills.some(fill => fill.width === 1400 && fill.height === 1812));
+    wheelTo(host, 100000);
+    const bottom = engine.getViewport();
+    assert.equal(engine.getDocument().id, pages[2].id);
+    assert.ok(Math.abs(bottom.y + 1812 * bottom.zoom - 872) < 1e-6, 'last page bottom uses its real height');
+  }, pages[0]);
+});
+
+test('drawing on a wider neighboring page uses its centered local coordinates and separate history', () => {
+  const pages: InkDocument[] = [createDocument(), { ...createDocument(), pageSize: 'a4', orientation: 'landscape' }];
+  withEngine(({ engine, host, pointer }) => {
+    engine.setPages(pages); wheelTo(host, 800);
+    const view = engine.getViewport();
+    assert.equal(engine.getDocument().id, pages[0].id);
+    const target = {
+      clientX: view.x + (1400 - 1980) / 2 * view.zoom + 1800 * view.zoom,
+      clientY: view.y + (1900 + PAGE_GAP + 100) * view.zoom,
+    };
+    pointer('pointerdown', 0, 0, target); pointer('pointerup', 0, 0, target);
+    assert.equal(engine.getDocument().id, pages[1].id);
+    const point = engine.getDocument().strokes[0].points[0];
+    assert.ok(Math.abs(point.x - 1800) < 1e-6); assert.ok(Math.abs(point.y - 100) < 1e-6);
+    engine.undo(); assert.equal(engine.getDocument().strokes.length, 0);
+    engine.redo(); assert.equal(engine.getDocument().strokes.length, 1);
+    wheelTo(host, -800); assert.equal(engine.getDocument().id, pages[0].id);
+    assert.equal(engine.canUndo(), false);
+  }, pages[0]);
+});
+
+test('landscape search, selection resizing and inserted image bounds use its full width', () => {
+  const page: InkDocument = { ...createDocument(), pageSize: 'a4', orientation: 'landscape' };
+  withEngine(({ engine, host, pointer }) => {
+    engine.setSearchHighlights([{ x: 1960, y: 1380, width: 50, height: 50 }]);
+    assert.match(host.layers[0].children[0].style.cssText, /width:20px;height:20px/);
+    engine.addImage({ id: 'edge', src: 'data:image/png;base64,aGVsbG8=', x: 1800, y: 1000, width: 150, height: 100 });
+    assert.throws(() => engine.addImage({ id: 'outside', src: 'data:image/png;base64,aGVsbG8=', x: 1800, y: 1400, width: 150, height: 100 }));
+    const at = (type: string, x: number, y: number) => {
+      const view = engine.getViewport(); pointer(type, 0, 0, { clientX: view.x + x * view.zoom, clientY: view.y + y * view.zoom });
+    };
+    engine.setTool('lasso');
+    at('pointerdown', 1780, 980); at('pointermove', 1970, 980); at('pointermove', 1970, 1120); at('pointermove', 1780, 1120); at('pointerup', 1780, 980);
+    engine.resizeSelection(2); engine.duplicateSelection();
+    assert.equal(engine.getDocument().images!.length, 2);
+    for (const image of engine.getDocument().images!) {
+      assert.ok(image.width > 150); assert.ok(image.x + image.width <= 1980); assert.ok(image.y + image.height <= 1400);
+    }
+    assert.doesNotThrow(() => parseDocument(JSON.stringify({ version: 2, pages: [engine.getDocument()] })));
+  }, page);
+});
+
+
+test('format undo preserves subsequent text edits, additions and deletions with valid geometry', () => {
+  const page = note();
+  page.textBoxes = [
+    { id: 'edited', x: 900, y: 1600, width: 300, height: 200, fontSize: 28, color: '#123456', text: 'Before' },
+    { id: 'deleted', x: 100, y: 100, width: 300, height: 200, fontSize: 28, color: '#123456', text: 'Remove me' },
+  ];
+  withEngine(({ engine }) => {
+    engine.setPageFormat({ orientation: 'landscape' });
+    const formatted = engine.getDocument();
+    const edited = { ...formatted, textBoxes: [
+      { ...formatted.textBoxes![0], text: 'Keep my later edit', color: '#ff0000', x: formatted.textBoxes![0].x + 20 },
+      { id: 'new', x: 1600, y: 1100, width: 300, height: 200, fontSize: 28, color: '#123456', text: 'New note' },
+    ] };
+    engine.setPages([edited]);
+    engine.undo();
+    const restored = engine.getDocument();
+    assert.deepEqual(pageDimensions(restored), pageDimensions(page));
+    assert.deepEqual(restored.textBoxes!.map(box => box.id), ['edited', 'new']);
+    assert.equal(restored.textBoxes![0].text, 'Keep my later edit');
+    assert.equal(restored.textBoxes![0].color, '#ff0000');
+    assert.ok(restored.textBoxes![0].x > page.textBoxes![0].x, 'later movement survives');
+    assert.equal(restored.textBoxes![0].y, page.textBoxes![0].y, 'unchanged geometry restores exactly');
+    assert.equal(restored.textBoxes![0].fontSize, 28);
+    assert.doesNotThrow(() => parseDocument(JSON.stringify({ version: 2, pages: [restored] })));
+    engine.redo(); assert.deepEqual(engine.getDocument(), edited, 'redo restores edited text exactly');
+    engine.undo(); assert.deepEqual(engine.getDocument(), restored, 'repeated undo is stable');
+  }, page);
+});
+
+test('ordinary ink undo retains current text before undoing the earlier format', () => {
+  const page = note();
+  page.textBoxes = [{ id: 'text', x: 100, y: 200, width: 300, height: 200, fontSize: 28, color: '#123456', text: 'Before' }];
+  withEngine(({ engine, pointer }) => {
+    engine.setPageFormat({ orientation: 'landscape' });
+    pointer('pointerdown', 100, 100); pointer('pointerup', 120, 130);
+    const edited = { ...engine.getDocument(), textBoxes: engine.getDocument().textBoxes!.map(box => ({ ...box, text: 'After drawing' })) };
+    engine.setPages([edited]);
+    engine.undo(); assert.equal(engine.getDocument().textBoxes![0].text, 'After drawing');
+    engine.undo(); assert.equal(engine.getDocument().textBoxes![0].text, 'After drawing');
+    assert.equal(engine.getDocument().textBoxes![0].x, 100);
+    engine.redo(); engine.redo(); assert.equal(engine.getDocument().textBoxes![0].text, 'After drawing');
+  }, page);
 });

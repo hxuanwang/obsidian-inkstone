@@ -7,6 +7,10 @@ import type { TextBox } from '../src/model';
 class Element extends EventTarget {
   children: Element[] = [];
   parent: Element | null = null;
+  get parentElement() { return this.parent; }
+  clientWidth = 420;
+  scrollLeft = 0;
+  scrollTop = 0;
   className = '';
   dataset: Record<string, string> = {};
   attributes: Record<string, string> = {};
@@ -45,7 +49,7 @@ function pointer(target: Element, type: string, x: number, y: number, pointerId 
 }
 function withLayer(run: (state: { layer: TextLayer; surface: Element; changes: TextBox[][]; move: () => Element; input: () => Element }) => void) {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
-  Object.defineProperty(globalThis, 'document', { configurable: true, value: { createElement: (tag: string) => new Element(tag) } });
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { createElement: (tag: string) => new Element(tag), createTextNode: (text: string) => Object.assign(new Element('#text'), {textContent: text}) } });
   const surface = new Element();
   const changes: TextBox[][] = [];
   const layer = new TextLayer(surface as unknown as HTMLElement, () => ({ x: 30, y: 40, zoom: 2 }), boxes => changes.push(structuredClone(boxes)), () => '#123456');
@@ -117,5 +121,54 @@ test('text inputs become read-only and leave keyboard navigation when text tool 
     assert.equal(input().readOnly, true); assert.equal(input().tabIndex, -1);
     layer.setEnabled(true);
     assert.equal(input().readOnly, false); assert.equal(input().tabIndex, 0);
+  });
+});
+
+
+test('on-page search marks only matching text and follows scrolling', () => {
+  withLayer(({layer, surface, input}) => {
+    layer.setBoxes([box({text: 'Hello world Hello'})]);
+    layer.setQuery('hello');
+    const mirror = surface.querySelector('.inkstone-text-highlight-content')!;
+    assert.equal(mirror.querySelectorAll('mark').length, 2);
+    input().scrollTop = 24;
+    input().dispatchEvent(new Event('scroll'));
+    assert.equal(mirror.style.transform, 'translate(0px,-24px)');
+    layer.setQuery('absent');
+    assert.equal(mirror.children.length, 0);
+  });
+});
+
+test('text insertion and page overlay use the current paper dimensions', () => {
+  withLayer(({ layer, surface, changes }) => {
+    layer.setPageFormat({ pageSize: 'a4' });
+    pointer(surface, 'pointerdown', 40 + 500 * 2, 60 + 1950 * 2);
+    pointer(surface, 'pointerup', 40 + 500 * 2, 60 + 1950 * 2);
+    assert.equal(changes.at(-1)!.at(-1)!.y, 1780, 'A4 text can reach below the standard-page edge');
+    layer.setPageFormat({ pageSize: 'a4', orientation: 'landscape' });
+    layer.setBoxes([]);
+    const overlay = surface.querySelector('.inkstone-text-layer')!;
+    assert.equal(overlay.style.width, '1980px'); assert.equal(overlay.style.height, '1400px');
+    pointer(surface, 'pointerdown', 40 + 1900 * 2, 60 + 1350 * 2);
+    pointer(surface, 'pointerup', 40 + 1900 * 2, 60 + 1350 * 2);
+    assert.equal(changes.at(-1)![0].x, 1560); assert.equal(changes.at(-1)![0].y, 1200);
+    const count = changes.length;
+    pointer(surface, 'pointerdown', 40 + 1900 * 2, 60 + 1500 * 2);
+    pointer(surface, 'pointerup', 40 + 1900 * 2, 60 + 1500 * 2);
+    assert.equal(changes.length, count, 'clicks beyond the landscape bottom cannot create unsavable text');
+  });
+});
+
+test('paper changes cancel pending insertion and text dragging clamps to landscape bounds', () => {
+  withLayer(({ layer, surface, changes, move }) => {
+    pointer(surface, 'pointerdown', 500, 500);
+    layer.setPageFormat({ pageSize: 'a4', orientation: 'landscape' });
+    pointer(surface, 'pointerup', 500, 500);
+    assert.equal(changes.length, 0);
+    const handle = move();
+    pointer(handle, 'pointerdown', 200, 300);
+    pointer(handle, 'pointerup', 10000, 10000);
+    assert.equal(changes.at(-1)![0].x, 1560);
+    assert.equal(changes.at(-1)![0].y, 1200);
   });
 });

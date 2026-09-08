@@ -14,9 +14,11 @@ export function visionRequest(model: string, image: string, instructions = ''): 
 }
 export function readVisionResponse(value: unknown): string {
   const data=value as {choices?:{finish_reason?:string;message?:{content?:unknown}}[]};
-  const choice=data?.choices?.[0];
+  const choice=Array.isArray(data?.choices)?data.choices[0]:undefined;
   if(choice?.finish_reason==='length')throw new Error('The AI response was truncated. Try a model with a larger output limit.');
   const text=choice?.message?.content;
   if(typeof text!=='string'||!text.trim()||text.length>200_000)throw new Error('The provider returned an empty or invalid Markdown response.');
-  return text.trim().replace(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$/,'$1');
+  const markdown=text.trim().replace(/^```(?:markdown|md)?[ \t]*\r?\n(?:([\s\S]*?)\r?\n)?```$/,'$1');
+  if(!markdown.trim())throw new Error('The provider returned an empty or invalid Markdown response.');
+  return markdown;
 }

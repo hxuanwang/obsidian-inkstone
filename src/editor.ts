@@ -1,11 +1,14 @@
 import { DEFAULT_SETTINGS, type InkstoneSettings, type PencilAction } from './settings';
 import { TextLayer, appendTextToSvg } from './text-layer';
 import { InkEngine } from './ink-engine';
+import { paperSvg } from './paper';
+import { openTemplatePicker } from './template-picker';
+import type { ShapeMode } from './geometry';
 import { NoteIndex } from './search';
 import { appendHighlightedText, matchingWordBoxes, matchSnippet, findMatchRanges } from './search-highlights';
 import { inkSignature } from './ink-signature';
 import type { RecognitionResult } from './recognition';
-import { createPage, MAX_PAGES, MAX_TEXT_LENGTH, type InkDocument, type InkPage, type Paper } from './model';
+import { createPage, pageDimensions, MAX_PAGES, MAX_TEXT_LENGTH, MAX_IMAGE_BYTES, isImageSource, PAGE_WIDTH, PAGE_HEIGHT, type InkDocument, type InkPage, type Paper } from './model';
 
 type Tool = 'pen' | 'highlighter' | 'eraser' | 'hand' | 'lasso' | 'shape' | 'text';
 export interface EditorOptions {
@@ -24,6 +27,13 @@ export interface EditorOptions {
   onRecognize?: (page: InkPage) => Promise<RecognitionResult>;
 }
 const paths: Record<string, string> = {
+  up: '<path d="m6 12 6-6 6 6M12 6v14"/>',
+  down: '<path d="m6 12 6 6 6-6M12 4v14"/>',
+  copy: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V3H3v13h5"/>',
+  trash: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
+  star: '<path d="m12 3 3 6 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1Z"/>',
+  sparkles: '<path d="m12 3 2 7 7 2-7 2-2 7-2-7-7-2 7-2ZM20 2v4m-2-2h4"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8" cy="8" r="2"/><path d="m3 17 6-6 4 4 3-3 5 5"/>',
   close: '<path d="m6 6 12 12M6 18 18 6"/>',
   grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   list: '<path d="M8 5h13M8 12h13M8 19h13M3 5h.01M3 12h.01M3 19h.01"/>',
@@ -76,12 +86,14 @@ export class InkEditor {
   private hint: HTMLElement;
   private undoButton: HTMLButtonElement;
   private redoButton: HTMLButtonElement;
-  private paperSelect: HTMLSelectElement;
+  private closeTemplate?: () => void;
+  private closePageOptions?: () => void;
   private toolButtons = new Map<Tool, HTMLButtonElement>();
   private selectedTool: Tool = 'pen';
   private previousTool: Tool = 'highlighter';
   private writingTool: Tool = 'pen';
   private pencilPalette!: HTMLElement;
+  private shapeSelect!: HTMLSelectElement;
   private eraserSelect!: HTMLSelectElement;
   private color = '#243c34';
   private toolColors = {pen: '#243c34', highlighter: '#e7bb4b'};
@@ -122,7 +134,7 @@ export class InkEditor {
   private searchMode = false;
   private notebookIndex = new NoteIndex();
   private signatureCache = new WeakMap<InkPage['strokes'], string>();
-  private thumbnailCache = new Map<string, {strokes: InkPage["strokes"]; textBoxes: InkPage["textBoxes"]; node: SVGSVGElement}>();
+  private thumbnailCache = new Map<string, {strokes: InkPage["strokes"]; textBoxes: InkPage["textBoxes"]; images: InkPage["images"]; paper: Paper; format: string; node: SVGSVGElement}>();
   private pagesTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(host: HTMLElement, private options: EditorOptions) {
@@ -165,6 +177,9 @@ export class InkEditor {
       button.setAttribute('aria-pressed', String(tool === 'pen'));
       button.dataset.tool = tool; this.toolButtons.set(tool, button); tools.append(button);
     }
+    const imageInput = el('input', 'inkstone-image-input'); imageInput.type = 'file'; imageInput.accept = 'image/png,image/jpeg,image/gif,image/webp'; imageInput.hidden = true;
+    imageInput.addEventListener('change', () => { const file = imageInput.files?.[0]; imageInput.value = ''; if (file) void this.insertImage(file); });
+    tools.append(this.button('image', 'Insert image', () => imageInput.click()), imageInput);
     const colors = el('div', 'inkstone-tool-group inkstone-colors');
     const palette = [['#243c34', 'Forest'], ['#1e2025', 'Black'], ['#1976ee', 'Blue'], ['#df332e', 'Red'], ['#e7bb4b', 'Ochre']];
     for (const [color, name] of palette) {
@@ -200,11 +215,23 @@ export class InkEditor {
       this.widths[this.selectedTool] = Number(this.sizeSlider.value);
       this.engine.setWidth(this.widths[this.selectedTool]); this.updateSizes();
     });
-    toolbar.append(currentTool, this.eraserSelect, this.sizePresets, colors, weight, this.sizeSlider);
+    this.shapeSelect = el('select', 'inkstone-select'); this.shapeSelect.setAttribute('aria-label', 'Shape type'); this.shapeSelect.hidden = true;
+    for (const [value, label] of [['auto', 'Recognize shape'], ['rectangle', 'Rectangle'], ['ellipse', 'Ellipse'], ['line', 'Line'], ['arrow', 'Arrow']]) {
+      const option = el('option', '', label); option.value = value; this.shapeSelect.append(option);
+    }
+    this.shapeSelect.addEventListener('change', () => this.engine.setShapeMode(this.shapeSelect.value as ShapeMode));
+    toolbar.append(currentTool, this.shapeSelect, this.eraserSelect, this.sizePresets, colors, weight, this.sizeSlider);
     tools.append(this.notesToggle); navigation.append(history); header.insertBefore(tools, actions);
     const surface = el('div', 'inkstone-surface'); surface.tabIndex = 0;
     surface.setAttribute('aria-label', 'Handwriting canvas. Use Apple Pencil or mouse to write; fingers move and zoom the page.');
     this.selectionActions = el('div', 'inkstone-selection-actions'); this.selectionActions.hidden = true;
+    this.selectionActions.setAttribute('role', 'group'); this.selectionActions.setAttribute('aria-label', 'Selection actions');
+    const selectionColor = el('label', 'inkstone-selection-color', 'Ink color');
+    const recolor = el('input', ''); recolor.type = 'color'; recolor.value = this.color; recolor.setAttribute('aria-label', 'Recolor selected ink');
+    recolor.addEventListener('change', () => this.engine.recolorSelection(recolor.value)); selectionColor.append(recolor);
+    this.selectionActions.append(selectionColor,
+      this.button('minus', 'Shrink selection by 10%', () => this.engine.resizeSelection(1 / 1.1)),
+      this.button('plus', 'Enlarge selection by 10%', () => this.engine.resizeSelection(1.1)));
     this.selectionActions.append(this.button('plus', 'Duplicate selection', () => this.engine.duplicateSelection(), 'Duplicate'),
       this.button('eraser', 'Delete selection', () => this.engine.deleteSelection(), 'Delete'),
       this.button('lasso', 'Clear selection', () => this.engine.clearSelection(), 'Deselect'));
@@ -212,7 +239,10 @@ export class InkEditor {
     this.pagePullLabel=el('span','inkstone-pull-label','Pull to add page');this.pagePullLabel.setAttribute('role','status');
     this.pagePullRing=el('div','inkstone-pull-ring');this.pagePullRing.setAttribute('role','progressbar');this.pagePullRing.setAttribute('aria-label','Pull to add page');this.pagePullRing.setAttribute('aria-valuemin','0');this.pagePullRing.setAttribute('aria-valuemax','100');
     this.pagePullRing.append(icon('plus'));
-    const preview=el('div','inkstone-pull-preview');preview.setAttribute('aria-hidden','true');
+    const preview=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    preview.classList.add('inkstone-pull-preview');preview.setAttribute('aria-hidden','true');
+    preview.setAttribute('preserveAspectRatio','xMidYMin slice');
+    let previewFormat='';
     this.pagePullHint.append(el('span','inkstone-pull-arrow','↑'),this.pagePullRing,this.pagePullLabel,preview);
     const exitFocus=this.button('close','Exit focus mode',()=>this.root.classList.remove('inkstone-focus-mode'),'Exit focus');exitFocus.classList.add('inkstone-exit-focus');
     this.pencilPalette=el('div','inkstone-pencil-palette');this.pencilPalette.hidden=true;this.pencilPalette.setAttribute('role','dialog');this.pencilPalette.setAttribute('aria-label','Tool palette');
@@ -222,14 +252,7 @@ export class InkEditor {
 
     const footer = el('footer', 'inkstone-footer');
     const left = el('div', 'inkstone-footer-group');
-    const paperLabel = el('label', 'inkstone-paper-picker'); paperLabel.append(icon('page'));
-    this.paperSelect = el('select', 'inkstone-select'); this.paperSelect.setAttribute('aria-label', 'Paper style');
-    for (const [value, label] of [['dots', 'Dotted paper'], ['ruled', 'Ruled paper'], ['grid', 'Grid paper'], ['blank', 'Blank paper']]) {
-      const option = el('option', '', label); option.value = value; this.paperSelect.append(option);
-    }
-    this.paperSelect.value = this.getActivePage().paper;
-    this.paperSelect.addEventListener('change', () => this.engine.setPaper(this.paperSelect.value as Paper));
-    paperLabel.append(this.paperSelect); left.append(paperLabel);
+    left.append(this.button('page', 'Paper templates', () => this.showTemplates(), 'Paper templates'));
     this.counter = el('span', 'inkstone-counter'); left.append(this.counter);
     this.hint = el('span', 'inkstone-hint', 'Pencil writes. Fingers move.');
     const right = el('div', 'inkstone-footer-group');
@@ -252,15 +275,43 @@ export class InkEditor {
     footer.classList.add('inkstone-page-controls-menu');
     this.root.append(header, body); host.append(this.root);
     this.pageControls = footer;
+    let pullFrame=0, pullValue=0;
+    const paintPull=(value:number)=>{
+      pullValue=value;this.pagePullHint.hidden=value<=.001;
+      this.pagePullHint.style.setProperty('--pull',String(value));
+      const lift=Math.min(180,surface.clientHeight*.35)*value;
+      surface.style.setProperty('--ink-pull-lift',`${-lift}px`);
+      this.pagePullHint.style.height=`${lift+28}px`;
+    };
+    const settlePull=()=>{
+      cancelAnimationFrame(pullFrame);
+      if(window.matchMedia('(prefers-reduced-motion: reduce)').matches){paintPull(0);return;}
+      const start=performance.now(),initial=pullValue;
+      const frame=(now:number)=>{
+        const t=(now-start)/1000,omega=22;
+        const value=initial*(1+omega*t)*Math.exp(-omega*t);
+        paintPull(value<.001?0:value);
+        if(value>=.001)pullFrame=requestAnimationFrame(frame);
+      };
+      pullFrame=requestAnimationFrame(frame);
+    };
+    this.cleanup.push(()=>cancelAnimationFrame(pullFrame));
     this.engine = new InkEngine(surface, {
       document: this.getActivePage(),
       onChange: page => {
         const current = this.document.pages.find(item => item.id === page.id);
         if (!current) return;
         if (current.strokes !== page.strokes && current.transcript) this.recognitionStatus.textContent = 'Ink changed. The saved transcript may need updating.';
-        const merged = { ...current, paper: page.paper, strokes: page.strokes, recognition: current.strokes === page.strokes ? current.recognition : undefined };
+        const before=pageDimensions(current),after=pageDimensions(page);
+        const resized=before.width!==after.width||before.height!==after.height;
+        const merged = { ...current, paper: page.paper, pageSize: page.pageSize, orientation: page.orientation, paperColor: page.paperColor, textBoxes: resized ? page.textBoxes : current.textBoxes, strokes: page.strokes, images: page.images, recognition: current.strokes === page.strokes ? current.recognition : undefined };
         if (current.strokes !== page.strokes) this.engine.setSearchHighlights([]);
         this.document = { ...this.document, pages: this.document.pages.map(item => item.id === page.id ? merged : item) };
+        if(resized || current.textBoxes !== merged.textBoxes){
+          this.textLayer?.setBoxes(merged.textBoxes);
+          // Format undo owns resized boxes; old text snapshots use different page coordinates.
+          this.textUndo=[];this.textRedo=[];this.lastTextEdit=0;
+        }
         this.updateState(merged); this.emitChange(); this.schedulePages();
         if (current.strokes !== page.strokes) this.scheduleRecognition(page.id);
       },
@@ -271,21 +322,25 @@ export class InkEditor {
       onSelectionChange: count => { this.selectionActions.hidden = count === 0; },
       onViewportChange: scale => { zoom.textContent = `${Math.round(scale * 100)}%`; this.textLayer?.position(); },
       onPagePull: progress => {
-        this.pagePullHint.hidden = progress === 0;
+        cancelAnimationFrame(pullFrame);
+        if(progress===0)settlePull();else paintPull(progress);
         const label=this.document.pages.length>=MAX_PAGES ? '500-page limit reached' : progress>=1 ? 'Release to add page' : 'Pull to add page';
         if(this.pagePullLabel.textContent!==label)this.pagePullLabel.textContent=label;
         this.pagePullRing.setAttribute('aria-valuenow',String(Math.round(progress*100)));
         this.pagePullRing.setAttribute('aria-label','Pull to add page');
-        this.pagePullHint.dataset.paper=this.document.pages.at(-1)!.paper;
+        const lastPage=this.document.pages.at(-1)!;
+        const format=JSON.stringify([lastPage.paper,lastPage.pageSize,lastPage.orientation,lastPage.paperColor]);
+        if(format!==previewFormat){
+          previewFormat=format;
+          const {width,height}=pageDimensions(lastPage);
+          preview.setAttribute('viewBox',`0 0 ${width} ${height}`);
+          preview.innerHTML=paperSvg(lastPage.paper,lastPage);
+        }
         this.pagePullHint.dataset.ready=String(progress>=1);
-        this.pagePullHint.style.setProperty('--pull',String(progress));
-        const lift=Math.min(240,surface.clientHeight*.45)*progress;
-        surface.style.setProperty('--ink-pull-lift',`${-lift}px`);
-        this.pagePullHint.style.height=`${lift+28}px`;
         const viewport=this.engine?.getViewport();
-        if(viewport)this.pagePullHint.style.width=`${Math.min(surface.clientWidth-32,1400*viewport.zoom)}px`;
+        if(viewport)this.pagePullHint.style.width=`${Math.min(surface.clientWidth-32,pageDimensions(this.document.pages.at(-1)!).width*viewport.zoom)}px`;
       },
-      onPageAdvance: () => this.addPage(false, false, true),
+      onPageAdvance: () => {cancelAnimationFrame(pullFrame);paintPull(0);this.addPage(false, false, true);},
     });
     this.textLayer = new TextLayer(surface,()=>this.engine.getViewport(),boxes=>{
       const now=Date.now();
@@ -324,10 +379,11 @@ export class InkEditor {
     if(tool!==this.selectedTool)this.previousTool=this.selectedTool;
     if(tool!=='eraser')this.writingTool=tool;
     this.eraserSelect.hidden=tool!=='eraser';
+    this.shapeSelect.hidden=tool!=='shape';
     this.floatingPalette.hidden=['hand','lasso'].includes(tool);
     this.floatingPalette.dataset.tool=tool;
     this.selectedTool = tool; this.engine.setTool(tool === 'text' ? 'hand' : tool); this.textLayer.setEnabled(tool==='text');this.root.classList.toggle('inkstone-text-tool',tool==='text');
-    this.hint.textContent=tool==='text'?'Tap the page to type. Drag Move to position text.':tool==='shape'?'Draw one shape, then lift to straighten.':'Pencil writes. Fingers move.';
+    this.hint.textContent=tool==='text'?'Tap the page to type. Drag Move to position text.':tool==='shape'?'Choose a shape and drag to draw.':tool==='lasso'?'Circle objects to select. Drag to move or use a corner to resize.':'Pencil writes. Fingers move.';
     if (tool === 'pen' || tool === 'highlighter' || tool === 'shape') { this.color = this.toolColors[tool === 'highlighter' ? 'highlighter' : 'pen']; this.engine.setColor(this.color); }
     this.engine.setWidth(this.widths[tool]);
     for (const [key, button] of this.toolButtons) button.setAttribute('aria-pressed', String(tool === key));
@@ -370,9 +426,9 @@ export class InkEditor {
   }
   private updateColors(): void { for (const b of this.swatches) b.setAttribute('aria-pressed', String(b.dataset.color === this.color)); }
   private updateState(doc: InkPage): void {
+    this.textLayer?.setPageFormat(doc);
     this.counter.textContent = `${doc.strokes.length} ${doc.strokes.length === 1 ? 'stroke' : 'strokes'}`;
-    this.undoButton.disabled = this.selectedTool==='text' ? !this.textUndo.length : !this.engine.canUndo(); this.redoButton.disabled = this.selectedTool==='text' ? !this.textRedo.length : !this.engine.canRedo();
-    this.paperSelect.value = doc.paper;
+    this.undoButton.disabled = this.selectedTool==='text' ? !this.textUndo.length && !this.engine.canUndo() : !this.engine.canUndo(); this.redoButton.disabled = this.selectedTool==='text' ? !this.textRedo.length && !this.engine.canRedo() : !this.engine.canRedo();
     this.pagePosition.textContent = `Page ${this.document.pages.findIndex(page => page.id === doc.id) + 1} of ${this.document.pages.length}`;
   }
   private emitChange(): void { this.engine?.setPages(this.document.pages); this.options.onChange(this.document); }
@@ -399,17 +455,11 @@ export class InkEditor {
     this.pageList = el('div', 'inkstone-page-list');
     this.pageTitle = el('input', 'inkstone-input'); this.pageTitle.maxLength = 500; this.pageTitle.setAttribute('aria-label', 'Page title');
     this.pageTitle.addEventListener('input', () => this.updatePage({ title: this.pageTitle.value }));
-    const controls = el('div', 'inkstone-page-controls');
-    controls.append(this.button('plus', 'Duplicate page', () => this.addPage(true), 'Duplicate'),
-      this.button('undo', 'Move page earlier', () => this.movePage(-1)), this.button('redo', 'Move page later', () => this.movePage(1)),
-      this.button('eraser', 'Delete page', () => this.confirmDeletePage()));
-    const inspector = el('details', 'inkstone-page-inspector'); const summary = el('summary', '', 'Page options');
-    inspector.append(summary, this.pageTitle, controls, el('p', 'inkstone-panel-hint', 'Ink undo history is retained per page while this notebook is open.'));
     this.searchNavigation = el('div', 'inkstone-search-navigation');
     this.searchHint = el('p','inkstone-panel-hint');
     this.searchNavigation.append(this.button('undo','Previous matching page',()=>this.navigateSearch(-1)), this.button('redo','Next matching page',()=>this.navigateSearch(1)));
     if (this.options.onSearch) this.searchNavigation.append(this.button('search','Search entire vault',()=>this.options.onSearch?.(),'Search vault'));
-    this.sidebar.append(heading, views, this.pageFilter, this.searchInput, this.pageCount, this.pageList, this.searchNavigation, this.searchHint, inspector);
+    this.sidebar.append(heading, views, this.pageFilter, this.searchInput, this.pageCount, this.pageList, this.searchNavigation, this.searchHint);
   }
   private buildNotesPanel(): void {
     this.notesPanel = el('aside', 'inkstone-notes-panel'); this.notesPanel.setAttribute('aria-label', 'Page text');
@@ -448,8 +498,19 @@ export class InkEditor {
       const button = el('button', 'inkstone-page-card'); button.type = 'button'; button.setAttribute('aria-pressed', String(page.id === this.activePageId));
       button.setAttribute('aria-label', `Page ${index + 1}: ${page.title || 'Untitled page'}`);
       const cached = this.thumbnailCache.get(page.id);
-      const preview = cached?.strokes === page.strokes && cached?.textBoxes === page.textBoxes ? cached.node : document.createElementNS('http://www.w3.org/2000/svg', 'svg'); preview.classList.add('inkstone-thumbnail'); preview.setAttribute('viewBox', '0 0 1400 1900'); preview.setAttribute('aria-hidden', 'true'); preview.dataset.paper = page.paper;
-      if (cached?.strokes !== page.strokes || cached?.textBoxes !== page.textBoxes) for (const stroke of page.strokes.slice(-200)) {
+      const format=JSON.stringify([page.pageSize,page.orientation,page.paperColor]);
+      const dimensions=pageDimensions(page);
+      const unchanged = cached?.strokes === page.strokes && cached?.textBoxes === page.textBoxes && cached?.images === page.images && cached?.paper === page.paper && cached?.format === format;
+      const preview = unchanged ? cached.node : document.createElementNS('http://www.w3.org/2000/svg', 'svg'); preview.classList.add('inkstone-thumbnail'); preview.setAttribute('viewBox', `0 0 ${dimensions.width} ${dimensions.height}`); preview.style.aspectRatio=`${dimensions.width}/${dimensions.height}`; preview.setAttribute('aria-hidden', 'true'); preview.dataset.paper = page.paper;
+      if (!unchanged) {
+        preview.innerHTML = paperSvg(page.paper, page);
+        for (const item of page.images ?? []) {
+          const image = document.createElementNS('http://www.w3.org/2000/svg', 'image');
+          for (const key of ['x', 'y', 'width', 'height'] as const) image.setAttribute(key, String(item[key]));
+          image.setAttribute('href', item.src); preview.append(image);
+        }
+      }
+      if (!unchanged) for (const stroke of page.strokes.slice(-200)) {
         const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
         const step = Math.max(1, Math.floor(stroke.points.length / 100));
         const points = stroke.points.filter((_, i) => i % step === 0 || i === stroke.points.length - 1);
@@ -457,53 +518,127 @@ export class InkEditor {
         line.setAttribute('stroke-width', String(Math.max(stroke.width, 8))); line.setAttribute('stroke-linecap', 'round');
         if (stroke.tool === 'highlighter') line.setAttribute('opacity', '.35'); preview.append(line);
       }
-      if(cached?.strokes !== page.strokes || cached?.textBoxes !== page.textBoxes)for(const box of page.textBoxes??[]) {
+      if(!unchanged)for(const box of page.textBoxes??[]) {
         const text=document.createElementNS('http://www.w3.org/2000/svg','text');text.setAttribute('x',String(box.x+8));text.setAttribute('y',String(box.y+box.fontSize+8));text.setAttribute('font-size',String(box.fontSize));text.setAttribute('fill',box.color);text.textContent=box.text.split('\n')[0].slice(0,60);preview.append(text);
       }
-      this.thumbnailCache.set(page.id, {strokes: page.strokes, textBoxes:page.textBoxes, node: preview});
+      this.thumbnailCache.set(page.id, {strokes: page.strokes, textBoxes:page.textBoxes, images:page.images, paper:page.paper, format, node: preview});
       if (query) {
         button.classList.add('inkstone-search-card');
         const copy = el('span','inkstone-search-card-copy'); const title = el('strong','',`Page ${index+1}`);
         const snippet = el('span','inkstone-search-snippet'); appendHighlightedText(snippet, hits!.get(page.id)!.snippet || page.title, query);
         copy.append(title,snippet); button.append(copy,preview);
       } else { const caption = el('span','inkstone-page-card-caption'); caption.append(el('b','',String(index+1)), el('span','',`${page.favorite?'★ ':''}${page.outline?'§ ':''}${page.title || 'Untitled page'}`)); button.append(preview, caption); }
-      button.addEventListener('click', () => { this.setActivePage(page.id); this.updateSearchHighlights(true); }); this.pageList.append(button);
+      button.addEventListener('click', () => { this.setActivePage(page.id); this.updateSearchHighlights(true); }); const card=el('div','inkstone-page-item');
+      const options=this.button('more',`Page ${index+1} options`,()=>this.showPageOptions(page.id,options));
+      options.classList.add('inkstone-page-options');options.setAttribute('aria-haspopup','dialog');
+      card.append(button,options);this.pageList.append(card);
+      button.addEventListener('contextmenu',event=>{event.preventDefault();this.showPageOptions(page.id,options);});
+      button.addEventListener('keydown',event=>{if(event.key==='ContextMenu'||event.shiftKey&&event.key==='F10'){event.preventDefault();this.showPageOptions(page.id,options);}});
     }
     const shown=this.pageList.childElementCount;
     this.pageCount.textContent=query?`${shown} matching ${shown===1?'page':'pages'}`:`${this.pageFilter.selectedOptions[0].textContent} · ${shown}`;
-    if (!this.pageList.childElementCount) this.pageList.append(el('p', 'inkstone-panel-hint', 'No matching pages.'));
+    if (!shown) this.pageList.append(el('p', 'inkstone-panel-hint', 'No matching pages.'));
+    if(!query && this.pageFilter.value==='all') {
+      const add=this.button('plus','Add page at end',()=>this.addPage(false,false,true));
+      add.classList.add('inkstone-add-page');add.disabled=this.document.pages.length>=MAX_PAGES;this.pageList.append(add);
+    }
   }
   private addPage(duplicate = false, before = false, atEnd = false): void {
     if (this.document.pages.length >= MAX_PAGES) { this.recognitionStatus.textContent = 'This notebook has reached the 500-page limit.'; this.root.classList.add('inkstone-notes-open'); return; }
     this.engine.flush();
     const active = atEnd ? this.document.pages.at(-1)! : this.getActivePage();
     const page = duplicate ? { ...structuredClone(active), id: createPage().id, title: `${active.title} copy`.slice(0, 500) } : createPage(`Page ${this.document.pages.length + 1}`);
-    if(!duplicate)page.paper=active.paper;
+    if(!duplicate)Object.assign(page,{paper:active.paper,pageSize:active.pageSize,orientation:active.orientation,paperColor:active.paperColor});
     const pages = [...this.document.pages]; pages.splice(pages.findIndex(item => item.id === active.id) + (before ? 0 : 1), 0, page);
     this.document = { ...this.document, pages }; this.emitChange(); this.pageFilter.value='all'; this.setSearchQuery(''); this.setActivePage(page.id);
   }
+  private async insertImage(file: File): Promise<void> {
+    const pageId = this.activePageId, lifecycle = this.lifecycle;
+    try {
+      if (file.size > MAX_IMAGE_BYTES) throw new Error('Choose an image smaller than 10 MB.');
+      if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type)) throw new Error('Choose a PNG, JPEG, GIF, or WebP image.');
+      const src = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error('The image could not be read.')); reader.readAsDataURL(file);
+      });
+      if (!isImageSource(src)) throw new Error('The image data is invalid.');
+      const image = new Image(); image.src = src; await image.decode();
+      if (this.disposed || this.lifecycle !== lifecycle || this.activePageId !== pageId) return;
+      const {width:pageWidth,height:pageHeight}=pageDimensions(this.getActivePage());
+      const scale = Math.min(1, pageWidth * .7 / image.naturalWidth, pageHeight * .6 / image.naturalHeight);
+      const width = image.naturalWidth * scale, height = image.naturalHeight * scale;
+      this.engine.addImage({id: crypto.randomUUID(), src, width, height, x: (pageWidth - width) / 2, y: (pageHeight - height) / 2});
+      this.selectTool('lasso');
+    } catch (error) {
+      if (this.disposed) return;
+      this.recognitionStatus.textContent = error instanceof Error ? error.message : 'The image could not be inserted.';
+      this.root.classList.add('inkstone-notes-open'); this.notesToggle.setAttribute('aria-pressed', 'true');
+    }
+  }
   private undo(): void {
-    if(this.selectedTool!=='text'){this.engine.undo();return;}
+    if(this.selectedTool!=='text'||!this.textUndo.length){this.engine.undo();return;}
     if(!this.textUndo.length)return;
     this.textRedo.push(this.getActivePage().textBoxes); this.updatePage({textBoxes:this.textUndo.pop()});
     this.textLayer.setBoxes(this.getActivePage().textBoxes);this.lastTextEdit=0;this.updateState(this.getActivePage());
   }
   private redo(): void {
-    if(this.selectedTool!=='text'){this.engine.redo();return;}
+    if(this.selectedTool!=='text'||!this.textRedo.length){this.engine.redo();return;}
     if(!this.textRedo.length)return;
     this.textUndo.push(this.getActivePage().textBoxes);this.updatePage({textBoxes:this.textRedo.pop()});
     this.textLayer.setBoxes(this.getActivePage().textBoxes);this.lastTextEdit=0;this.updateState(this.getActivePage());
+  }
+  private actionIcon(label: string): string {
+    if(label.includes('earlier'))return 'up';if(label.includes('later'))return 'down';
+    if(label.includes('Undo'))return 'undo';if(label.includes('Redo'))return 'redo';
+    if(label.includes('Duplicate'))return 'copy';if(label.includes('Delete'))return 'trash';
+    if(label.includes('favorite'))return 'star';if(label.includes('outline'))return 'list';
+    if(label.includes('Export'))return 'export';if(label.includes('AI'))return 'sparkles';
+    if(label.includes('Focus'))return 'fit';if(label.includes('Add')||label.includes('New'))return 'plus';
+    return 'page';
+  }
+  private showTemplates(): void {
+    this.closePageOptions?.();this.closeTemplate?.();this.engine.flush();
+    const id=this.activePageId;
+    this.closeTemplate=openTemplatePicker(this.root,this.getActivePage(),format=>{
+      if(this.activePageId===id&&!this.disposed)this.engine.setPageFormat(format);
+    });
+  }
+  private showPageOptions(id: string, anchor: HTMLElement): void {
+    this.closePageOptions?.();
+    const page=this.document.pages.find(p=>p.id===id);if(!page)return;
+    const index=this.document.pages.indexOf(page);
+    const panel=el('div','inkstone-page-popover');panel.setAttribute('role','dialog');panel.setAttribute('aria-label',`Page ${index+1} options`);
+    let closed=false;
+    const close=()=>{if(closed)return;closed=true;panel.remove();document.removeEventListener('pointerdown',outside,true);if(this.closePageOptions===close)this.closePageOptions=undefined;if(anchor.isConnected)anchor.focus({preventScroll:true});};
+    const outside=(event:PointerEvent)=>{if(!panel.contains(event.target as Node)&&!anchor.contains(event.target as Node))close();};
+    this.closePageOptions=close;
+    panel.append(el('strong','',`Page ${index+1}`));
+    const title=el('input','inkstone-input');title.value=page.title;title.maxLength=500;title.setAttribute('aria-label','Page title');
+    title.addEventListener('change',()=>{this.document={...this.document,pages:this.document.pages.map(p=>p.id===id?{...p,title:title.value}:p)};this.emitChange();this.renderPages();});panel.append(title);
+    const action=(label:string,fn:()=>void,disabled=false)=>{const b=this.button(this.actionIcon(label),label,()=>{close();this.setActivePage(id);fn();},label);b.disabled=disabled;panel.append(b);};
+    action('Paper templates',()=>this.showTemplates());action('Add page before',()=>this.addPage(false,true));action('Add page after',()=>this.addPage());
+    action('Duplicate page',()=>this.addPage(true),this.document.pages.length>=MAX_PAGES);
+    action(page.favorite?'Remove from favorites':'Add to favorites',()=>{this.updatePage({favorite:!page.favorite});this.renderPages();});
+    action(page.outline?'Remove from outline':'Add to outline',()=>{this.updatePage({outline:!page.outline});this.renderPages();});
+    action('Move page earlier',()=>this.movePage(-1),index===0);action('Move page later',()=>this.movePage(1),index===this.document.pages.length-1);
+    action('Delete page',()=>this.confirmDeletePage(),this.document.pages.length===1);
+    panel.addEventListener('keydown',event=>{event.stopPropagation();if(event.key==='Escape'){event.preventDefault();close();}});
+    this.root.append(panel);
+    const bounds=this.root.getBoundingClientRect(),rect=anchor.getBoundingClientRect();
+    panel.style.left=`${Math.max(8,Math.min(rect.left-bounds.left,bounds.width-panel.offsetWidth-8))}px`;
+    panel.style.top=`${Math.max(8,Math.min(rect.bottom-bounds.top,bounds.height-panel.offsetHeight-8))}px`;
+    document.addEventListener('pointerdown',outside,true);title.focus();
   }
   private renderPageMenu(): void {
     const menu=this.pageMenu.querySelector('.inkstone-more-menu')!;menu.replaceChildren();
     const page=this.getActivePage(),index=this.document.pages.findIndex(p=>p.id===page.id);
     menu.append(el('strong','',`Page ${index+1} · ${page.title}`), this.pageControls);
-    const action=(label:string,fn:()=>void)=>menu.append(this.button('page',label,()=>{this.pageMenu.open=false;fn();},label));
+    const action=(label:string,fn:()=>void)=>menu.append(this.button(this.actionIcon(label),label,()=>{this.pageMenu.open=false;fn();},label));
     action('Undo',()=>this.undo()); action('Redo',()=>this.redo());
     action('Focus writing (Tab)',()=>this.root.classList.add('inkstone-focus-mode'));
     if(this.options.onMarkdown)action('Export notebook as Markdown',()=>{this.engine.flush();this.options.onMarkdown?.(this.document);});
     if(this.options.onAI)action('Convert page to Markdown with AI…',()=>{this.engine.flush();void this.options.onAI?.(structuredClone(this.getActivePage()),appendTextToSvg(this.engine.exportSvg(),this.getActivePage().textBoxes));});
     action('Add page before',()=>this.addPage(false,true));action('Add page after',()=>this.addPage());
+    action('Paper templates',()=>this.showTemplates());
     action('Duplicate page',()=>this.addPage(true));
     action(page.favorite?'Remove from favorites':'Add to favorites',()=>{this.updatePage({favorite:!page.favorite});this.renderPages();});
     action(page.outline?'Remove from outline':'Add to outline',()=>{this.updatePage({outline:!page.outline});this.renderPages();});
@@ -601,7 +736,7 @@ export class InkEditor {
     let signature=this.signatureCache.get(page.strokes);
     if (query && recognition && !signature) { signature=inkSignature(page.strokes); this.signatureCache.set(page.strokes,signature); }
     const valid=recognition && recognition.transcript===page.transcript && signature===recognition.inkSignature;
-    const boxes=query && valid ? matchingWordBoxes(recognition.words,query) : [];
+    const boxes=query && valid ? matchingWordBoxes(recognition.words,query,recognition.transcript) : [];
     this.engine.setSearchHighlights(boxes, focus && boxes.length ? 0 : -1);
     if (focus && boxes.length) this.engine.focusSearchHighlight(0);
     this.textMatches.replaceChildren(); this.textMatches.hidden=true;
@@ -614,6 +749,7 @@ export class InkEditor {
     this.searchHint.textContent = query && findMatchRanges(page.transcript,query).length && !valid ? 'Recognize this page again to highlight matching words on the ink.' : '';
   }
   setActivePage(pageId: string): void {
+    this.closeTemplate?.();this.closePageOptions?.();
     if (pageId === this.activePageId || !this.document.pages.some(page => page.id === pageId)) return;
     this.sidebar.querySelector('.inkstone-delete-confirm')?.remove();
     this.engine.flush(); this.engine.setPages(this.document.pages); this.activePageId = pageId; this.engine.setDocument(this.getActivePage()); this.engine.fitWidth();
@@ -621,11 +757,12 @@ export class InkEditor {
   }
   getActivePage(): InkPage { return this.document.pages.find(page => page.id === this.activePageId) ?? this.document.pages[0]; }
   setDocument(doc: InkDocument): void {
+    this.closeTemplate?.();this.closePageOptions?.();
     this.engine.flush(); clearTimeout(this.recognitionTimer); this.pendingOCR.clear();
     this.lifecycle++; this.thumbnailCache.clear(); this.signatureCache = new WeakMap(); this.document = doc; this.engine.setPages(doc.pages); this.activePageId = doc.pages[0].id; this.engine.setDocument(this.getActivePage());
     this.syncPageFields(); this.updateState(this.getActivePage()); this.renderPages(); this.updateSearchHighlights();
   }
   setTitle(title: string): void { this.titleEl.textContent = title; }
   getDocument(): InkDocument { return this.document; }
-  destroy(): void { this.textLayer.destroy(); this.engine.destroy(); this.disposed = true; clearTimeout(this.recognitionTimer); this.pendingOCR.clear(); this.lifecycle++; if (this.pagesTimer) clearTimeout(this.pagesTimer); this.cleanup.forEach(fn => fn()); this.root.remove(); }
+  destroy(): void { this.closeTemplate?.();this.closePageOptions?.();this.textLayer.destroy(); this.engine.destroy(); this.disposed = true; clearTimeout(this.recognitionTimer); this.pendingOCR.clear(); this.lifecycle++; if (this.pagesTimer) clearTimeout(this.pagesTimer); this.cleanup.forEach(fn => fn()); this.root.remove(); }
 }

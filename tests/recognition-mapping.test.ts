@@ -143,3 +143,26 @@ test('OCR stays cold for empty ink and serializes exact submitted snapshots', as
     assert.equal(starts, 1, 'Consecutive OCR jobs reuse one worker');
   } finally { await recognizer.destroy(); globalThis.document = original; }
 });
+
+test('OCR crops and maps landscape ink with the dimensions captured when submitted', async () => {
+  const original = globalThis.document;
+  globalThis.document = fakeCanvasDocument();
+  const page = inkPage(); page.pageSize = 'a4'; page.orientation = 'landscape';
+  page.strokes[0].points[0] = { x: 1900, y: 1300, pressure: .5, time: 0 };
+  let submittedSize: number[] = [];
+  const factory: typeof createWorker = async () => fakeWorker({ recognize: (async image => {
+    const canvas = image as HTMLCanvasElement;
+    submittedSize = [canvas.width, canvas.height];
+    return { data: { text: 'EDGE', blocks: blocks([{ text: 'EDGE', bbox: { x0: 1, y0: 1, x1: 200, y1: 200 } }]) } };
+  }) as Worker['recognize'] });
+  const recognizer = new LocalRecognizer('/ocr', factory, 1000);
+  try {
+    const job = recognizer.recognize(page);
+    page.orientation = 'portrait';
+    const result = await job;
+    assert.deepEqual(submittedSize, [70, 70]);
+    assert.deepEqual(result.words, [{ text: 'EDGE', x: 1866, y: 1266, width: 114, height: 134 }]);
+    assert.deepEqual(mapRecognitionWords(blocks([{ text: 'low', bbox: { x0: 0, y0: 0, x1: 30, y1: 30 } }]), 100, 1950, { pageSize: 'a4' }),
+      [{ text: 'low', x: 100, y: 1950, width: 30, height: 30 }]);
+  } finally { await recognizer.destroy(); globalThis.document = original; }
+});

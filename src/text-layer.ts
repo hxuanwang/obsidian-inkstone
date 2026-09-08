@@ -1,5 +1,5 @@
-import { PAGE_WIDTH, PAGE_HEIGHT, MAX_TEXT_LENGTH, type TextBox } from './model';
-import { findMatchRanges } from './search-highlights';
+import { pageDimensions, MAX_TEXT_LENGTH, type PageFormat, type TextBox } from './model';
+import { appendHighlightedText, findMatchRanges } from './search-highlights';
 
 type Viewport = { x: number; y: number; zoom: number };
 /** Page-space text stays separate from ink and the recognition image. */
@@ -8,6 +8,7 @@ export class TextLayer {
   private enabled = false;
   private spellcheck = true;
   private boxes: TextBox[] = [];
+  private dimensions = pageDimensions();
   private revision = 0;
   private query = '';
   private pointers = new Set<number>();
@@ -27,8 +28,8 @@ export class TextLayer {
       if (!this.enabled || tap?.id !== event.pointerId || Math.hypot(event.clientX-tap.x,event.clientY-tap.y)>8) return;
       const rect=surface.getBoundingClientRect(), view=this.viewport();
       const x=(event.clientX-rect.left-view.x)/view.zoom, y=(event.clientY-rect.top-view.y)/view.zoom;
-      if (x<0 || y<0 || x>PAGE_WIDTH || y>PAGE_HEIGHT || this.boxes.length>=1000) return;
-      const box:TextBox={id:crypto.randomUUID(),x:Math.min(x,PAGE_WIDTH-420),y:Math.min(y,PAGE_HEIGHT-200),width:420,height:200,fontSize:28,color:this.color(),text:''};
+      if (x<0 || y<0 || x>this.dimensions.width || y>this.dimensions.height || this.boxes.length>=1000) return;
+      const box:TextBox={id:crypto.randomUUID(),x:Math.min(x,this.dimensions.width-420),y:Math.min(y,this.dimensions.height-200),width:420,height:200,fontSize:28,color:this.color(),text:''};
       this.boxes=[...this.boxes,box]; this.change(this.boxes); this.render(box.id);
     };
     const cancel=(event:PointerEvent)=>{this.tap=null;this.pointers.delete(event.pointerId);};
@@ -39,10 +40,35 @@ export class TextLayer {
   setSpellcheck(enabled:boolean):void { this.spellcheck=enabled; for(const input of this.layer.querySelectorAll('textarea'))input.spellcheck=enabled; }
   setEnabled(enabled:boolean):void { this.enabled=enabled;for(const input of this.layer.querySelectorAll('textarea')){input.readOnly=!enabled;input.tabIndex=enabled?0:-1;} this.layer.classList.toggle('is-editing',enabled); this.tap=null; this.pointers.clear(); if(!enabled) (this.layer.querySelector(':focus') as HTMLElement)?.blur(); }
   setBoxes(boxes:TextBox[]=[]):void { this.revision++;this.tap=null;this.pointers.clear();this.boxes=boxes;this.render(); }
+  /** Geometry only; the editor supplies the page's saved text boxes separately. */
+  setPageFormat(format:PageFormat):void {
+    const dimensions=pageDimensions(format);
+    if(dimensions.width!==this.dimensions.width || dimensions.height!==this.dimensions.height){this.revision++;this.tap=null;this.pointers.clear();}
+    this.dimensions=dimensions;
+    this.layer.style.width=`${dimensions.width}px`;this.layer.style.height=`${dimensions.height}px`;
+  }
   setQuery(query:string):void {this.query=query;this.markMatches();}
   position():void { const view=this.viewport();this.layer.style.setProperty('--text-zoom',String(view.zoom));this.layer.style.transform=`translate(${view.x}px,${view.y}px) scale(${view.zoom})`; }
   private update(id:string,patch:Partial<TextBox>,notify=true):void {this.boxes=this.boxes.map(box=>box.id===id?{...box,...patch}:box);if(notify)this.change(this.boxes);}
-  private markMatches():void {for(const node of this.layer.querySelectorAll<HTMLElement>('.inkstone-text-box')) {const box=this.boxes.find(box=>box.id===node.dataset.id);node.classList.toggle('has-match',!!box && !!this.query && findMatchRanges(box.text,this.query).length>0);}}
+  private markMatches():void {
+    for(const node of this.layer.querySelectorAll<HTMLElement>('.inkstone-text-box')) {
+      const box=this.boxes.find(box=>box.id===node.dataset.id);
+      const mirror=node.querySelector<HTMLElement>('.inkstone-text-highlight-content')!;
+      const matches=!!box && !!this.query && findMatchRanges(box.text,this.query).length>0;
+      node.classList.toggle('has-match',matches);
+      mirror.parentElement!.hidden=!matches;
+      if(matches) appendHighlightedText(mirror,box!.text,this.query);
+      else mirror.replaceChildren();
+      this.positionHighlights(node);
+    }
+  }
+  private positionHighlights(node:HTMLElement):void {
+    const input=node.querySelector('textarea')!;
+    const mirror=node.querySelector<HTMLElement>('.inkstone-text-highlight-content')!;
+    // Match the textarea's wrapping width, including space reserved for its scrollbar.
+    mirror.style.width=`${input.clientWidth}px`;
+    mirror.style.transform=`translate(${-input.scrollLeft}px,${-input.scrollTop}px)`;
+  }
   private render(focus?:string):void {
     this.layer.replaceChildren();
     for(const box of this.boxes) {
@@ -53,22 +79,25 @@ export class TextLayer {
       move.addEventListener('pointerdown',event=>{
         event.preventDefault();event.stopPropagation();move.setPointerCapture(event.pointerId);
         const revision=this.revision;const original=this.boxes.find(b=>b.id===box.id)!;const start={x:event.clientX,y:event.clientY};const zoom=this.viewport().zoom;
-        const onMove=(e:PointerEvent)=>{if(e.pointerId!==event.pointerId || revision!==this.revision)return;e.stopPropagation();const x=Math.max(0,Math.min(PAGE_WIDTH-box.width,original.x+(e.clientX-start.x)/zoom));const y=Math.max(0,Math.min(PAGE_HEIGHT-box.height,original.y+(e.clientY-start.y)/zoom));node.style.left=`${x}px`;node.style.top=`${y}px`;this.update(box.id,{x,y},false);};
+        const onMove=(e:PointerEvent)=>{if(e.pointerId!==event.pointerId || revision!==this.revision)return;e.stopPropagation();const x=Math.max(0,Math.min(this.dimensions.width-box.width,original.x+(e.clientX-start.x)/zoom));const y=Math.max(0,Math.min(this.dimensions.height-box.height,original.y+(e.clientY-start.y)/zoom));node.style.left=`${x}px`;node.style.top=`${y}px`;this.update(box.id,{x,y},false);};
         const done=(e:PointerEvent)=>{if(e.pointerId!==event.pointerId)return;e.stopPropagation();if(e.type==='pointerup' && revision===this.revision){onMove(e);this.change(this.boxes);}move.removeEventListener('pointermove',onMove);move.removeEventListener('pointerup',done);move.removeEventListener('pointercancel',cancel);move.removeEventListener('lostpointercapture',cancel);};
         const cancel=(e:PointerEvent)=>{if(e.pointerId!==event.pointerId)return;if(revision===this.revision)this.update(box.id,{x:original.x,y:original.y},false);node.style.left=`${original.x}px`;node.style.top=`${original.y}px`;done(e);};
         move.addEventListener('pointermove',onMove);move.addEventListener('pointerup',done);move.addEventListener('pointercancel',cancel);move.addEventListener('lostpointercapture',cancel);
       });
-      move.addEventListener('keydown',event=>{const directions:Record<string,[number,number]>={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]};const d=directions[event.key];if(!d)return;event.preventDefault();const b=this.boxes.find(b=>b.id===box.id)!;const step=event.shiftKey?20:5;const x=Math.max(0,Math.min(PAGE_WIDTH-b.width,b.x+d[0]*step)),y=Math.max(0,Math.min(PAGE_HEIGHT-b.height,b.y+d[1]*step));this.update(box.id,{x,y});node.style.left=`${x}px`;node.style.top=`${y}px`;});
+      move.addEventListener('keydown',event=>{const directions:Record<string,[number,number]>={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]};const d=directions[event.key];if(!d)return;event.preventDefault();const b=this.boxes.find(b=>b.id===box.id)!;const step=event.shiftKey?20:5;const x=Math.max(0,Math.min(this.dimensions.width-b.width,b.x+d[0]*step)),y=Math.max(0,Math.min(this.dimensions.height-b.height,b.y+d[1]*step));this.update(box.id,{x,y});node.style.left=`${x}px`;node.style.top=`${y}px`;});
       const remove=document.createElement('button');remove.type='button';remove.textContent='Remove';remove.setAttribute('aria-label','Remove text box');
       remove.addEventListener('click',()=>{this.boxes=this.boxes.filter(b=>b.id!==box.id);this.change(this.boxes);this.render();});
       const size=document.createElement('select');size.setAttribute('aria-label','Text font size');
-      for(const n of [20,28,36,48,64]){const option=document.createElement('option');option.value=String(n);option.textContent=`${n}`;size.append(option);}size.value=String(box.fontSize);
-      size.addEventListener('change',()=>{this.update(box.id,{fontSize:Number(size.value)});node.style.fontSize=`${size.value}px`;});
+      for(const n of [...new Set([20,28,36,48,64,box.fontSize])].sort((a,b)=>a-b)){const option=document.createElement('option');option.value=String(n);option.textContent=String(Math.round(n*10)/10);size.append(option);}size.value=String(box.fontSize);
+      size.addEventListener('change',()=>{this.update(box.id,{fontSize:Number(size.value)});node.style.fontSize=`${size.value}px`;this.positionHighlights(node);});
       const input=document.createElement('textarea');input.className='inkstone-page-text-input';input.value=box.text;input.readOnly=!this.enabled;input.tabIndex=this.enabled?0:-1;input.spellcheck=this.spellcheck;input.placeholder='Type here…';input.setAttribute('aria-label','Text on page');
+      const highlights=document.createElement('div');highlights.className='inkstone-text-highlight-overlay';highlights.setAttribute('aria-hidden','true');
+      const mirror=document.createElement('div');mirror.className='inkstone-text-highlight-content';highlights.append(mirror);
+      input.addEventListener('scroll',()=>this.positionHighlights(node));
       input.maxLength=Math.min(10000,MAX_TEXT_LENGTH-this.boxes.reduce((n,b)=>n+(b.id===box.id?0:b.text.length),0));
       input.addEventListener('input',()=>{const remaining=MAX_TEXT_LENGTH-this.boxes.reduce((n,b)=>n+(b.id===box.id?0:b.text.length),0);if(input.value.length>remaining)input.value=input.value.slice(0,remaining);this.update(box.id,{text:input.value});this.markMatches();});
       for(const event of ['pointerdown','pointermove','pointerup','pointercancel','wheel'])node.addEventListener(event,e=>e.stopPropagation());
-      controls.append(move,size,remove);node.append(controls,input);this.layer.append(node);
+      controls.append(move,size,remove);node.append(controls,highlights,input);this.layer.append(node);
       if(box.id===focus) input.focus();
     }
     this.markMatches();this.position();

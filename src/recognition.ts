@@ -5,7 +5,7 @@ const lazyCreateWorker: typeof createWorker = async (...args) => {
   const engine = await import('tesseract.js');
   return engine.createWorker(...args);
 };
-import { PAGE_HEIGHT, PAGE_WIDTH, type InkPage, type Stroke, type RecognitionWord } from './model';
+import { pageDimensions, type PageFormat, type InkPage, type Stroke, type RecognitionWord } from './model';
 
 import { inkSignature } from './ink-signature';
 
@@ -42,13 +42,14 @@ export class LocalRecognizer {
     clearTimeout(this.idleTimer);
     // Preserve the exact submitted ink while an earlier page is being recognized.
     const signature = inkSignature(page.strokes);
+    const format: PageFormat = { pageSize: page.pageSize, orientation: page.orientation };
     const strokes = page.strokes.filter(s => s.tool === 'pen').map(s => ({ ...s, points: s.points.map(p => ({ ...p })) }));
     const job = this.queue.then(async () => {
       if (this.closed) throw new Error('Text recognition was cancelled.');
       if (!strokes.length) return { text: '', words: [], inkSignature: signature };
       let canvas: HTMLCanvasElement | undefined;
       try {
-        const crop = renderRecognitionCrop(strokes);
+        const crop = renderRecognitionCrop(strokes, format);
         canvas = crop.canvas;
         if (!this.worker) {
           let abandoned = false;
@@ -72,7 +73,7 @@ export class LocalRecognizer {
         }
         if (this.closed) throw new Error('Text recognition was cancelled.');
         const result = await this.runOperation(() => this.worker!.recognize(canvas!, {}, { text: true, blocks: true }));
-        return { text: result.data.text.trim(), words: mapRecognitionWords(result.data.blocks, crop.left, crop.top), inkSignature: signature };
+        return { text: result.data.text.trim(), words: mapRecognitionWords(result.data.blocks, crop.left, crop.top, format), inkSignature: signature };
       } catch (error) {
         await this.releaseWorker();
         if (this.closed) throw new Error('Text recognition was cancelled.');
@@ -109,18 +110,19 @@ export class LocalRecognizer {
 
 /** Crop blank margins while retaining native page resolution and a white border.
  * Highlighters and paper guides are deliberately omitted from the OCR image. */
-export function renderRecognitionInk(strokes: Stroke[]): HTMLCanvasElement {
-  return renderRecognitionCrop(strokes).canvas;
+export function renderRecognitionInk(strokes: Stroke[], format: PageFormat = {}): HTMLCanvasElement {
+  return renderRecognitionCrop(strokes, format).canvas;
 }
 
-export function renderRecognitionCrop(strokes: Stroke[]): { canvas: HTMLCanvasElement; left: number; top: number } {
-  let left = PAGE_WIDTH, right = 0, top = PAGE_HEIGHT, bottom = 0;
+export function renderRecognitionCrop(strokes: Stroke[], format: PageFormat = {}): { canvas: HTMLCanvasElement; left: number; top: number } {
+  const { width, height } = pageDimensions(format);
+  let left = width, right = 0, top = height, bottom = 0;
   for (const stroke of strokes) for (const p of stroke.points) {
     left = Math.min(left, p.x - stroke.width); right = Math.max(right, p.x + stroke.width);
     top = Math.min(top, p.y - stroke.width); bottom = Math.max(bottom, p.y + stroke.width);
   }
-  left = Math.min(PAGE_WIDTH, Math.max(0, Math.floor(left - 32))); top = Math.min(PAGE_HEIGHT, Math.max(0, Math.floor(top - 32)));
-  right = Math.min(PAGE_WIDTH, Math.ceil(right + 32)); bottom = Math.min(PAGE_HEIGHT, Math.ceil(bottom + 32));
+  left = Math.min(width, Math.max(0, Math.floor(left - 32))); top = Math.min(height, Math.max(0, Math.floor(top - 32)));
+  right = Math.min(width, Math.ceil(right + 32)); bottom = Math.min(height, Math.ceil(bottom + 32));
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(64, right - left); canvas.height = Math.max(64, bottom - top);
   const ctx = canvas.getContext('2d');
@@ -148,13 +150,14 @@ export function renderRecognitionCrop(strokes: Stroke[]): { canvas: HTMLCanvasEl
 type WordBlocks = readonly { paragraphs: readonly { lines: readonly { words: readonly {
   text: string; bbox: { x0: number; y0: number; x1: number; y1: number };
 }[] }[] }[] }[];
-export function mapRecognitionWords(blocks: WordBlocks | null, left: number, top: number): RecognitionWord[] {
+export function mapRecognitionWords(blocks: WordBlocks | null, left: number, top: number, format: PageFormat = {}): RecognitionWord[] {
   const words: RecognitionWord[] = [];
+  const { width, height } = pageDimensions(format);
   for (const block of blocks ?? []) for (const paragraph of block.paragraphs) for (const line of paragraph.lines) for (const word of line.words) {
     const { x0, y0, x1, y1 } = word.bbox;
     if (!word.text.trim() || ![x0, y0, x1, y1, left, top].every(Number.isFinite) || x1 <= x0 || y1 <= y0) continue;
     const x = Math.max(0, x0 + left), y = Math.max(0, y0 + top);
-    const right = Math.min(PAGE_WIDTH, x1 + left), bottom = Math.min(PAGE_HEIGHT, y1 + top);
+    const right = Math.min(width, x1 + left), bottom = Math.min(height, y1 + top);
     if (right > x && bottom > y) words.push({ text: word.text, x, y, width: right - x, height: bottom - y });
   }
   return words;

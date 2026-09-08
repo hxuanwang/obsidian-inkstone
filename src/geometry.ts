@@ -119,3 +119,20 @@ export function recognizeShape(points: Point[]): Point[] | null {
   });
   return result([...clean, clean[0]]);
 }
+
+export type ShapeMode = 'auto' | 'rectangle' | 'ellipse' | 'line' | 'arrow';
+/** Drag-defined shapes use a stable pressure and remain ordinary editable ink. */
+export function createShape(mode: Exclude<ShapeMode, 'auto'>, start: Point, end: Point): Point[] {
+  let vertices: XY[];
+  if (mode === 'rectangle') vertices = [start, { x: end.x, y: start.y }, end, { x: start.x, y: end.y }, start];
+  else if (mode === 'ellipse') {
+    const cx = (start.x + end.x) / 2, cy = (start.y + end.y) / 2;
+    const rx = Math.abs(end.x - start.x) / 2, ry = Math.abs(end.y - start.y) / 2;
+    vertices = Array.from({ length: 97 }, (_, i) => ({ x: cx + rx * Math.cos(i * Math.PI / 48), y: cy + ry * Math.sin(i * Math.PI / 48) }));
+  } else if (mode === 'arrow') {
+    const angle = Math.atan2(end.y - start.y, end.x - start.x), head = Math.min(30, distance(start, end) * 0.3);
+    vertices = [start, end, { x: end.x - head * Math.cos(angle - Math.PI / 6), y: end.y - head * Math.sin(angle - Math.PI / 6) }, end,
+      { x: end.x - head * Math.cos(angle + Math.PI / 6), y: end.y - head * Math.sin(angle + Math.PI / 6) }];
+  } else vertices = [start, end];
+  return vertices.map((p, i) => ({ ...p, pressure: start.pressure, time: start.time + (end.time - start.time) * i / Math.max(1, vertices.length - 1) }));
+}

@@ -10,7 +10,10 @@ test('Markdown export retains LaTeX and typed content across notebook pages',()=
 });
 test('AI responses reject empty, truncated and invalid output and unwrap Markdown only',()=>{
   assert.equal(readVisionResponse({choices:[{message:{content:'```markdown\n$x^2$\n```'}}]}),'$x^2$');
-  for(const response of [null,{}, {choices:[{message:{content:[]}}]}, {choices:[{finish_reason:'length',message:{content:'partial'}}]}])assert.throws(()=>readVisionResponse(response));
+  assert.equal(readVisionResponse({choices:[{message:{content:'```md\r\n$x^2$\r\n```'}}]}),'$x^2$');
+  assert.equal(readVisionResponse({choices:[{message:{content:'```python\nprint(1)\n```'}}]}),'```python\nprint(1)\n```');
+  for(const response of [null,{}, {choices:{0:{message:{content:'invalid choices'}}}}, {choices:[{message:{content:[]}}]}, {choices:[{finish_reason:'length',message:{content:'partial'}}]}])assert.throws(()=>readVisionResponse(response));
+  for(const content of ['```markdown\n```','```md\n\n```','```\n   \n```','```markdown\r\n\r\n```'])assert.throws(()=>readVisionResponse({choices:[{message:{content}}]}),/empty or invalid/);
   const request=visionRequest('vision','data:image/png;base64,abc') as any;
   assert.equal(request.messages[0].content[1].image_url.url,'data:image/png;base64,abc');
 });
