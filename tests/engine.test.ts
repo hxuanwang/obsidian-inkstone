@@ -45,6 +45,8 @@ class Layer {
   replaceChildren() { this.children = []; }
 }
 class Host extends EventTarget {
+  ownerDocument = Object.assign(new EventTarget(), { defaultView: new EventTarget() });
+  contains(target: unknown) { return target === this; }
   canvases: Canvas[] = [];
   width = 1024; height = 900;
   layers: Layer[] = [];
@@ -137,6 +139,58 @@ test('Pencil takes precedence over a finger already on the page and ignores palm
   });
 });
 
+test('editor save echoes do not replay historical ink between rapid Pencil strokes', () => {
+  withEngine(({ engine, host, pointer, flush }) => {
+    const arcs = host.canvases[0].context.arcs;
+    for (let i = 0; i < 12; i++) {
+      pointer('pointerdown', 300 + i * 10, 300);
+      pointer('pointerup', 305 + i * 10, 320);
+      engine.setPages([{ ...engine.getDocument(), transcript: 'Updated metadata' }]);
+      flush();
+    }
+    assert.equal(host.canvases[0].context.arcs, arcs);
+    assert.equal(engine.getDocument().strokes.length, 13);
+    const page = engine.getDocument();
+    engine.setPages([{ ...page, strokes: [] }]); flush();
+    assert.equal(engine.getDocument().strokes.length, 0, 'real external canvas edits still refresh');
+  }, note());
+});
+
+test('canvas touch gestures suppress native scrolling while Pencil input remains active', () => {
+  withEngine(({ engine, host, pointer }) => {
+    pointer('pointerdown', 300, 300);
+    const touch = new Event('touchstart', { cancelable: true });
+    Object.defineProperty(touch, 'target', { value: host });
+    host.ownerDocument.defaultView.dispatchEvent(touch);
+    assert.equal(touch.defaultPrevented, true);
+    pointer('pointermove', 320, 320);
+    pointer('pointerup', 340, 340);
+    assert.equal(engine.getDocument().strokes[0].points.length, 3);
+  });
+});
+
+test('mobile touch isolation covers the full gesture and leaves other panes and native controls alone', () => {
+  withEngine(({ engine, host }) => {
+    const dispatch = (type: string, target: unknown) => {
+      const event = new Event(type, { cancelable: true });
+      let stopped = false;
+      Object.defineProperty(event, 'target', { value: target });
+      event.stopPropagation = () => { stopped = true; };
+      host.ownerDocument.defaultView.dispatchEvent(event);
+      return { stopped, prevented: event.defaultPrevented };
+    };
+    for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) {
+      assert.deepEqual(dispatch(type, host), { stopped: true, prevented: type === 'touchstart' || type === 'touchmove' });
+      assert.deepEqual(dispatch(type, new EventTarget()), { stopped: false, prevented: false });
+    }
+    const control = { closest: () => control };
+    host.contains = target => target === host || target === control;
+    assert.deepEqual(dispatch('touchstart', control), { stopped: true, prevented: false });
+    engine.destroy();
+    assert.deepEqual(dispatch('touchstart', host), { stopped: false, prevented: false }, 'destroy removes window listeners');
+  });
+});
+
 test('coalesced input preserves real samples and unavailable WebKit input falls back', () => {
   withEngine(({ engine, pointer, event }) => {
     pointer('pointerdown', 300, 300);
@@ -147,6 +201,48 @@ test('coalesced input preserves real samples and unavailable WebKit input falls 
     const points = engine.getDocument().strokes[0].points;
     assert.equal(points.length, 4);
     assert.deepEqual(points.map(point => Math.round(point.x)), [300, 310, 320, 330]);
+  });
+});
+
+test('Pencil capture loss keeps the same stroke alive through document-level moves and release', () => {
+  withEngine(({ engine, host, pointer, event, changes }) => {
+    pointer('pointerdown', 300, 300);
+    pointer('pointermove', 320, 320);
+    pointer('lostpointercapture', 320, 320);
+    assert.equal(changes.length, 0, 'capture loss is not Pencil lift');
+    const move = event(340, 340);
+    host.ownerDocument.dispatchEvent(move);
+    const up = event(360, 360);
+    Object.defineProperty(up, 'type', { value: 'pointerup' });
+    host.ownerDocument.dispatchEvent(up);
+    assert.equal(changes.length, 1);
+    assert.deepEqual(engine.getDocument().strokes[0].points.map(p => Math.round(p.x)), [300, 320, 340, 360]);
+    host.ownerDocument.dispatchEvent(event(380, 380));
+    assert.equal(engine.getDocument().strokes[0].points.length, 4, 'hover after lift adds no ink');
+  });
+});
+
+test('real Pencil cancellation ends ink and a fresh contact stays a separate stroke', () => {
+  withEngine(({ engine, host, pointer, event }) => {
+    pointer('pointerdown', 300, 300);
+    pointer('pointermove', 320, 320);
+    pointer('lostpointercapture', 320, 320);
+    const cancel = event(340, 340);
+    Object.defineProperty(cancel, 'type', { value: 'pointercancel' });
+    host.ownerDocument.dispatchEvent(cancel);
+    host.ownerDocument.dispatchEvent(event(360, 360));
+    pointer('pointerdown', 400, 400);
+    pointer('pointerup', 420, 420);
+    assert.deepEqual(engine.getDocument().strokes.map(s => s.points.map(p => Math.round(p.x))), [[300, 320], [400, 420]]);
+  });
+});
+
+test('WebKit coalesced batches retain dispatched endpoints without duplicating samples', () => {
+  withEngine(({ engine, pointer, event }) => {
+    pointer('pointerdown', 300, 300);
+    pointer('pointermove', 330, 330, { getCoalescedEvents: () => [event(310, 310, { timeStamp: 1 }), event(320, 320, { timeStamp: 2 })], timeStamp: 3 });
+    pointer('pointerup', 350, 350, { getCoalescedEvents: () => [event(340, 340, { timeStamp: 4 }), event(350, 350, { timeStamp: 5 })], timeStamp: 5 });
+    assert.deepEqual(engine.getDocument().strokes[0].points.map(p => Math.round(p.x)), [300, 310, 320, 330, 340, 350]);
   });
 });
 

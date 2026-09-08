@@ -1,5 +1,6 @@
 import { pageDimensions, MAX_TEXT_LENGTH, type PageFormat, type TextBox } from './model';
-import { appendHighlightedText, findMatchRanges } from './search-highlights';
+import { findMatchRanges } from './search-highlights';
+import { appendSpellingText, loadSpelling, type SpellingDictionary } from './spelling';
 
 type Viewport = { x: number; y: number; zoom: number };
 /** Page-space text stays separate from ink and the recognition image. */
@@ -7,6 +8,10 @@ export class TextLayer {
   private layer = document.createElement('div');
   private enabled = false;
   private spellcheck = true;
+  private spelling: SpellingDictionary | null = null;
+  private spellingLoad: Promise<void> | null = null;
+  private spellingTimer: ReturnType<typeof setTimeout> | undefined;
+  private destroyed = false;
   private boxes: TextBox[] = [];
   private dimensions = pageDimensions();
   private revision = 0;
@@ -15,7 +20,8 @@ export class TextLayer {
   private tap: {id: number; x: number; y: number} | null = null;
   private cleanup: (() => void)[] = [];
   constructor(private surface: HTMLElement, private viewport: () => Viewport,
-    private change: (boxes: TextBox[]) => void, private color: () => string) {
+    private change: (boxes: TextBox[]) => void, private color: () => string,
+    private spellingLoader: () => Promise<SpellingDictionary> = loadSpelling) {
     this.layer.className = 'inkstone-text-layer'; surface.append(this.layer);
     const down = (event: PointerEvent) => {
       if (!this.enabled || (event.target as HTMLElement).closest('.inkstone-text-box') || event.button !== 0) return;
@@ -37,7 +43,21 @@ export class TextLayer {
       surface.addEventListener(name,fn); this.cleanup.push(()=>surface.removeEventListener(name,fn));
     }
   }
-  setSpellcheck(enabled:boolean):void { this.spellcheck=enabled; for(const input of this.layer.querySelectorAll('textarea'))input.spellcheck=enabled; }
+  setSpellcheck(enabled:boolean):void {
+    if(this.destroyed)return;
+    this.spellcheck=enabled;
+    clearTimeout(this.spellingTimer);
+    for(const input of this.layer.querySelectorAll('textarea'))input.spellcheck=enabled;
+    this.markMatches();
+    if(enabled && !this.spelling && !this.spellingLoad) {
+      this.spellingLoad=this.spellingLoader().then(dictionary=>{
+        if(this.destroyed)return;
+        this.spelling=dictionary;
+        if(this.spellcheck)this.markMatches();
+      }).catch(()=>{ /* Native spelling remains available if the dictionary cannot load. */ })
+        .finally(()=>{this.spellingLoad=null;});
+    }
+  }
   setEnabled(enabled:boolean):void { this.enabled=enabled;for(const input of this.layer.querySelectorAll('textarea')){input.readOnly=!enabled;input.tabIndex=enabled?0:-1;} this.layer.classList.toggle('is-editing',enabled); this.tap=null; this.pointers.clear(); if(!enabled) (this.layer.querySelector(':focus') as HTMLElement)?.blur(); }
   setBoxes(boxes:TextBox[]=[]):void { this.revision++;this.tap=null;this.pointers.clear();this.boxes=boxes;this.render(); }
   /** Geometry only; the editor supplies the page's saved text boxes separately. */
@@ -50,14 +70,16 @@ export class TextLayer {
   setQuery(query:string):void {this.query=query;this.markMatches();}
   position():void { const view=this.viewport();this.layer.style.setProperty('--text-zoom',String(view.zoom));this.layer.style.transform=`translate(${view.x}px,${view.y}px) scale(${view.zoom})`; }
   private update(id:string,patch:Partial<TextBox>,notify=true):void {this.boxes=this.boxes.map(box=>box.id===id?{...box,...patch}:box);if(notify)this.change(this.boxes);}
-  private markMatches():void {
+  private markMatches(includeSpelling=true):void {
+    if(this.destroyed)return;
+    const dictionary=includeSpelling && this.spellcheck ? this.spelling : null;
     for(const node of this.layer.querySelectorAll<HTMLElement>('.inkstone-text-box')) {
       const box=this.boxes.find(box=>box.id===node.dataset.id);
       const mirror=node.querySelector<HTMLElement>('.inkstone-text-highlight-content')!;
       const matches=!!box && !!this.query && findMatchRanges(box.text,this.query).length>0;
       node.classList.toggle('has-match',matches);
-      mirror.parentElement!.hidden=!matches;
-      if(matches) appendHighlightedText(mirror,box!.text,this.query);
+      mirror.parentElement!.hidden=!matches && !dictionary;
+      if(box && (matches || dictionary)) appendSpellingText(mirror,box.text,dictionary,this.query);
       else mirror.replaceChildren();
       this.positionHighlights(node);
     }
@@ -95,14 +117,14 @@ export class TextLayer {
       const mirror=document.createElement('div');mirror.className='inkstone-text-highlight-content';highlights.append(mirror);
       input.addEventListener('scroll',()=>this.positionHighlights(node));
       input.maxLength=Math.min(10000,MAX_TEXT_LENGTH-this.boxes.reduce((n,b)=>n+(b.id===box.id?0:b.text.length),0));
-      input.addEventListener('input',()=>{const remaining=MAX_TEXT_LENGTH-this.boxes.reduce((n,b)=>n+(b.id===box.id?0:b.text.length),0);if(input.value.length>remaining)input.value=input.value.slice(0,remaining);this.update(box.id,{text:input.value});this.markMatches();});
+      input.addEventListener('input',()=>{const remaining=MAX_TEXT_LENGTH-this.boxes.reduce((n,b)=>n+(b.id===box.id?0:b.text.length),0);if(input.value.length>remaining)input.value=input.value.slice(0,remaining);this.update(box.id,{text:input.value});this.markMatches(false);clearTimeout(this.spellingTimer);if(this.spellcheck)this.spellingTimer=setTimeout(()=>this.markMatches(),250);});
       for(const event of ['pointerdown','pointermove','pointerup','pointercancel','wheel'])node.addEventListener(event,e=>e.stopPropagation());
       controls.append(move,size,remove);node.append(controls,highlights,input);this.layer.append(node);
       if(box.id===focus) input.focus();
     }
     this.markMatches();this.position();
   }
-  destroy():void {this.cleanup.forEach(fn=>fn());this.layer.remove();}
+  destroy():void {this.destroyed=true;clearTimeout(this.spellingTimer);this.cleanup.forEach(fn=>fn());this.layer.remove();}
 }
 
 /** Portable SVG text, escaped through DOM serialization rather than string interpolation. */

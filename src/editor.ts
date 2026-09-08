@@ -1,6 +1,7 @@
 import { DEFAULT_SETTINGS, type InkstoneSettings, type PencilAction } from './settings';
 import { TextLayer, appendTextToSvg } from './text-layer';
 import { InkEngine } from './ink-engine';
+import { HandwritingSpelling } from './handwriting-spelling';
 import { paperSvg } from './paper';
 import { openTemplatePicker } from './template-picker';
 import type { ShapeMode } from './geometry';
@@ -74,6 +75,7 @@ export class InkEditor {
   private pagePullHint!: HTMLElement;
   private pagePullLabel!: HTMLElement;
   private pagePullRing!: HTMLElement;
+  private handwritingSpelling?: HandwritingSpelling;
   private pageFilter!: HTMLSelectElement;
   private pageMenu!: HTMLDetailsElement;
   private textUndo: InkPage['textBoxes'][] = [];
@@ -320,7 +322,7 @@ export class InkEditor {
         this.syncPageFields(); this.updateState(this.getActivePage()); this.schedulePages(); this.updateSearchHighlights();
       },
       onSelectionChange: count => { this.selectionActions.hidden = count === 0; },
-      onViewportChange: scale => { zoom.textContent = `${Math.round(scale * 100)}%`; this.textLayer?.position(); },
+      onViewportChange: scale => { zoom.textContent = `${Math.round(scale * 100)}%`; this.textLayer?.position(); this.handwritingSpelling?.position(); },
       onPagePull: progress => {
         cancelAnimationFrame(pullFrame);
         if(progress===0)settlePull();else paintPull(progress);
@@ -350,6 +352,7 @@ export class InkEditor {
       this.lastTextEdit=now;this.textRedo=[];
       this.updatePage({textBoxes:boxes});this.updateState(this.getActivePage());
     },()=>this.color);
+    this.handwritingSpelling = new HandwritingSpelling(surface,()=>this.engine.getViewport());
     this.engine.setPages(this.document.pages);
     this.engine.setColor(this.color); this.engine.setWidth(this.widths.pen);
     this.engine.setEraserMode(options.settings?.eraserMode ?? 'object');
@@ -395,6 +398,8 @@ export class InkEditor {
     this.root.dataset.toolbarSize=settings.toolbarSize;
     this.typedText.spellcheck = settings.spellcheck; this.transcript.spellcheck = settings.spellcheck;
     this.textLayer.setSpellcheck(settings.spellcheck);
+    this.handwritingSpelling?.setEnabled(settings.spellcheck);
+    this.handwritingSpelling?.setPage(this.getActivePage());
     if (!settings.realTimeOCR) { clearTimeout(this.recognitionTimer); this.pendingOCR.clear(); }
     this.eraserSelect.value=settings.eraserMode;this.engine.setEraserMode(settings.eraserMode);
   }
@@ -426,6 +431,7 @@ export class InkEditor {
   }
   private updateColors(): void { for (const b of this.swatches) b.setAttribute('aria-pressed', String(b.dataset.color === this.color)); }
   private updateState(doc: InkPage): void {
+    this.handwritingSpelling?.setPage(doc);
     this.textLayer?.setPageFormat(doc);
     this.counter.textContent = `${doc.strokes.length} ${doc.strokes.length === 1 ? 'stroke' : 'strokes'}`;
     this.undoButton.disabled = this.selectedTool==='text' ? !this.textUndo.length && !this.engine.canUndo() : !this.engine.canUndo(); this.redoButton.disabled = this.selectedTool==='text' ? !this.textRedo.length && !this.engine.canRedo() : !this.engine.canRedo();
@@ -477,7 +483,7 @@ export class InkEditor {
     this.recognitionStatus = el('p', 'inkstone-panel-hint'); this.recognitionStatus.setAttribute('role', 'status');
     this.recognitionStatus.textContent = this.options.onRecognize ? 'Recognition replaces the transcript. Review the result for accuracy.' : 'Handwriting recognition is available inside Obsidian when configured.';
     this.notesPanel.append(typedLabel, transcriptLabel, this.recognizeButton, this.recognitionStatus,
-      el('p', 'inkstone-panel-hint', 'Your system checks spelling in these text fields. Raw handwritten strokes are not spellchecked.'));
+      el('p', 'inkstone-panel-hint', 'Your system checks spelling in these text fields. After recognition, red wavy underlines on the page flag possible English spelling mistakes. Review the transcript if a handwritten word was misread.'));
   }
   private schedulePages(): void {
     if(!this.root.classList.contains('inkstone-pages-open'))return;
@@ -730,6 +736,7 @@ export class InkEditor {
     this.setActivePage(hits[next].pageId!); this.updateSearchHighlights(true);
   }
   private updateSearchHighlights(focus = false): void {
+    this.handwritingSpelling?.setPage(this.getActivePage());
     if (!this.engine || !this.textMatches) return;
     const page=this.getActivePage(), query=this.searchInput.value.trim(), recognition=page.recognition;
     this.textLayer?.setQuery(query);
@@ -764,5 +771,5 @@ export class InkEditor {
   }
   setTitle(title: string): void { this.titleEl.textContent = title; }
   getDocument(): InkDocument { return this.document; }
-  destroy(): void { this.closeTemplate?.();this.closePageOptions?.();this.textLayer.destroy(); this.engine.destroy(); this.disposed = true; clearTimeout(this.recognitionTimer); this.pendingOCR.clear(); this.lifecycle++; if (this.pagesTimer) clearTimeout(this.pagesTimer); this.cleanup.forEach(fn => fn()); this.root.remove(); }
+  destroy(): void { this.handwritingSpelling?.destroy(); this.closeTemplate?.();this.closePageOptions?.();this.textLayer.destroy(); this.engine.destroy(); this.disposed = true; clearTimeout(this.recognitionTimer); this.pendingOCR.clear(); this.lifecycle++; if (this.pagesTimer) clearTimeout(this.pagesTimer); this.cleanup.forEach(fn => fn()); this.root.remove(); }
 }

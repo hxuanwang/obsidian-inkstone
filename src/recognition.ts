@@ -69,11 +69,21 @@ export class LocalRecognizer {
               return worker;
             }));
           } catch (error) { abandoned = true; throw error; }
-          await this.runOperation(() => this.worker!.setParameters({ tessedit_pageseg_mode: '11' as PSM /* SPARSE_TEXT */, user_defined_dpi: '150' }));
         }
         if (this.closed) throw new Error('Text recognition was cancelled.');
-        const result = await this.runOperation(() => this.worker!.recognize(canvas!, {}, { text: true, blocks: true }));
-        return { text: result.data.text.trim(), words: mapRecognitionWords(result.data.blocks, crop.left, crop.top, format), inkSignature: signature };
+        // Reset segmentation on every job: a previous low-confidence page may
+        // have tried paragraph layout. Rendered pixels now carry 2× ink detail.
+        await this.runOperation(() => this.worker!.setParameters({ tessedit_pageseg_mode: '11' as PSM /* SPARSE_TEXT */, user_defined_dpi: String(Math.round(150 * crop.scale)) }));
+        let result = await this.runOperation(() => this.worker!.recognize(canvas!, {}, { text: true, blocks: true }));
+        // Sparse text handles scattered notes; a paragraph pass can recover
+        // connected lines it splits poorly. Never rewrite words via a dictionary.
+        // Keep this to one extra pass, on the same bounded raster and worker.
+        if (!result.data.text.trim() || (Number.isFinite(result.data.confidence) && result.data.confidence < 55)) {
+          await this.runOperation(() => this.worker!.setParameters({ tessedit_pageseg_mode: '6' as PSM /* SINGLE_BLOCK */ }));
+          const alternative = await this.runOperation(() => this.worker!.recognize(canvas!, {}, { text: true, blocks: true }));
+          if (alternative.data.text.trim() && (!result.data.text.trim() || alternative.data.confidence > result.data.confidence)) result = alternative;
+        }
+        return { text: result.data.text.trim(), words: mapRecognitionWords(result.data.blocks, crop.left, crop.top, format, crop.scale), inkSignature: signature };
       } catch (error) {
         await this.releaseWorker();
         if (this.closed) throw new Error('Text recognition was cancelled.');
@@ -108,30 +118,39 @@ export class LocalRecognizer {
   }
 }
 
-/** Crop blank margins while retaining native page resolution and a white border.
+/** Crop blank margins and rerender vector ink at higher resolution with a white border.
  * Highlighters and paper guides are deliberately omitted from the OCR image. */
 export function renderRecognitionInk(strokes: Stroke[], format: PageFormat = {}): HTMLCanvasElement {
   return renderRecognitionCrop(strokes, format).canvas;
 }
 
-export function renderRecognitionCrop(strokes: Stroke[], format: PageFormat = {}): { canvas: HTMLCanvasElement; left: number; top: number } {
+export function renderRecognitionCrop(strokes: Stroke[], format: PageFormat = {}): { canvas: HTMLCanvasElement; left: number; top: number; scale: number } {
   const { width, height } = pageDimensions(format);
   let left = width, right = 0, top = height, bottom = 0;
-  for (const stroke of strokes) for (const p of stroke.points) {
+  const pens = strokes.filter(stroke => stroke.tool === 'pen' && stroke.points.length);
+  for (const stroke of pens) for (const p of stroke.points) {
     left = Math.min(left, p.x - stroke.width); right = Math.max(right, p.x + stroke.width);
     top = Math.min(top, p.y - stroke.width); bottom = Math.max(bottom, p.y + stroke.width);
   }
-  left = Math.min(width, Math.max(0, Math.floor(left - 32))); top = Math.min(height, Math.max(0, Math.floor(top - 32)));
-  right = Math.min(width, Math.ceil(right + 32)); bottom = Math.min(height, Math.ceil(bottom + 32));
+  // Include whitespace beyond page edges too: tightly clipped letters are
+  // easily mistaken for page borders by Tesseract. Boxes are clamped on return.
+  left = Math.max(0, Math.min(width, Math.floor(left))) - 32;
+  top = Math.max(0, Math.min(height, Math.floor(top))) - 32;
+  right = Math.max(0, Math.min(width, Math.ceil(right))) + 32;
+  bottom = Math.max(0, Math.min(height, Math.ceil(bottom))) + 32;
+  const cropWidth = Math.max(64, right - left), cropHeight = Math.max(64, bottom - top);
+  // Bound the raster to ~24 MB of RGBA even on a full A4 page. A vector
+  // rerender preserves small pen curves instead of enlarging a blurry bitmap.
+  const scale = Math.min(2, Math.sqrt(6_000_000 / (cropWidth * cropHeight)));
   const canvas = document.createElement('canvas');
-  canvas.width = Math.max(64, right - left); canvas.height = Math.max(64, bottom - top);
+  canvas.width = Math.floor(cropWidth * scale); canvas.height = Math.floor(cropHeight * scale);
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('A drawing canvas is unavailable.');
   ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.scale(scale, scale);
   ctx.translate(-left, -top);
   ctx.strokeStyle = '#000000'; ctx.fillStyle = '#000000'; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  for (const stroke of strokes) {
-    if (stroke.tool !== 'pen') continue;
+  for (const stroke of pens) {
     const first = stroke.points[0];
     if (!first) continue;
     ctx.lineWidth = Math.max(1, stroke.width * 0.8);
@@ -143,21 +162,22 @@ export function renderRecognitionCrop(strokes: Stroke[], format: PageFormat = {}
       ctx.stroke();
     }
   }
-  return { canvas, left, top };
+  return { canvas, left, top, scale };
 }
 
-/** Tesseract boxes are in the cropped image's pixels, at native page scale. */
+/** Convert cropped raster pixels back to page units for ink search/spelling. */
 type WordBlocks = readonly { paragraphs: readonly { lines: readonly { words: readonly {
   text: string; bbox: { x0: number; y0: number; x1: number; y1: number };
 }[] }[] }[] }[];
-export function mapRecognitionWords(blocks: WordBlocks | null, left: number, top: number, format: PageFormat = {}): RecognitionWord[] {
+export function mapRecognitionWords(blocks: WordBlocks | null, left: number, top: number, format: PageFormat = {}, scale = 1): RecognitionWord[] {
   const words: RecognitionWord[] = [];
+  if (!Number.isFinite(scale) || scale <= 0) return words;
   const { width, height } = pageDimensions(format);
   for (const block of blocks ?? []) for (const paragraph of block.paragraphs) for (const line of paragraph.lines) for (const word of line.words) {
     const { x0, y0, x1, y1 } = word.bbox;
     if (!word.text.trim() || ![x0, y0, x1, y1, left, top].every(Number.isFinite) || x1 <= x0 || y1 <= y0) continue;
-    const x = Math.max(0, x0 + left), y = Math.max(0, y0 + top);
-    const right = Math.min(width, x1 + left), bottom = Math.min(height, y1 + top);
+    const x = Math.max(0, x0 / scale + left), y = Math.max(0, y0 / scale + top);
+    const right = Math.min(width, x1 / scale + left), bottom = Math.min(height, y1 / scale + top);
     if (right > x && bottom > y) words.push({ text: word.text, x, y, width: right - x, height: bottom - y });
   }
   return words;

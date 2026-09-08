@@ -109,7 +109,19 @@ export class InkEngine {
     this.host.addEventListener('pointermove', this.pointerMove, eventOptions);
     this.host.addEventListener('pointerup', this.pointerUp, eventOptions);
     this.host.addEventListener('pointercancel', this.pointerCancel, eventOptions);
-    this.host.addEventListener('lostpointercapture', this.pointerCancel, eventOptions);
+    this.host.addEventListener('lostpointercapture', this.lostPointerCapture, eventOptions);
+    // Capture can be lost without Pencil leaving the glass. Keep following that
+    // pen outside the surface until a real pointerup/cancel ends the stroke.
+    const owner = this.host.ownerDocument;
+    for (const name of ['pointermove', 'pointerup', 'pointercancel'] as const) {
+      owner?.addEventListener(name, this.documentPointer, { ...eventOptions, capture: true });
+    }
+    // Obsidian's mobile pull-down recognizer can listen on ancestors in the
+    // capture phase. A bubbling surface handler is too late to claim the drag.
+    const touchRoot = owner?.defaultView ?? this.host;
+    for (const name of ['touchstart', 'touchmove', 'touchend', 'touchcancel'] as const) {
+      touchRoot.addEventListener(name, this.canvasTouch as EventListener, { ...eventOptions, capture: true, passive: false });
+    }
     this.host.addEventListener('contextmenu', this.contextMenu, eventOptions);
     this.host.addEventListener('wheel', this.wheel, { ...eventOptions, passive: false });
     this.observer = new ResizeObserver(() => this.resize());
@@ -159,6 +171,13 @@ export class InkEngine {
   /** Synchronize notebook pages without disturbing the current gesture or scroll position. */
   setPages(pages: InkDocument[]): void {
     if (!pages.length) return;
+    // The editor echoes committed ink back with updated metadata. The live
+    // layer was already composited; do not replay a whole notebook per stroke.
+    const repaint = pages.length !== this.pages.length || pages.some((page, i) => {
+      const before = i === this.pageIndex ? this.document : this.pages[i];
+      return !before || page.id !== before.id || page.strokes !== before.strokes || page.images !== before.images ||
+        page.paper !== before.paper || page.pageSize !== before.pageSize || page.orientation !== before.orientation || page.paperColor !== before.paperColor;
+    });
     const previous = this.document;
     const index = pages.findIndex(page => page.id === this.document.id);
     if (index >= 0) {
@@ -181,7 +200,7 @@ export class InkEngine {
     const ids = new Set(pages.map(page => page.id));
     for (const id of this.histories.keys()) if (!ids.has(id)) this.histories.delete(id);
     this.positionSearchHighlights();
-    this.scheduleRedraw();
+    if (repaint) this.scheduleRedraw();
   }
   private rememberPage(): void {
     this.pages[this.pageIndex] = this.document;
@@ -202,6 +221,7 @@ export class InkEngine {
     this.options.onActivePageChange?.(this.document);
   }
   setDocument(document: InkDocument): void {
+    this.pencilPointer = null;
     const previous = this.document;
     this.cancelPagePull();
     this.setSearchHighlights([]);
@@ -659,6 +679,30 @@ export class InkEngine {
   private toPage(point: XY): XY { return { x: (point.x - this.offset.x) / this.zoom, y: (point.y - this.offset.y) / this.zoom }; }
   private inside(point: XY): boolean { return point.x >= 0 && point.y >= 0 && point.x <= this.pageSize.width && point.y <= this.pageSize.height; }
   private capture(event: PointerEvent): void { try { this.host.setPointerCapture(event.pointerId); } catch { /* Detached hosts cannot capture. */ } }
+  private pencilPointer: number | null = null;
+  private canvasTouch = (event: TouchEvent): void => {
+    const target = event.target as HTMLElement | null;
+    if (!target || !this.host.contains(target)) return;
+    // PointerEvents still deliver canvas pan/pinch/Pencil input. Native text
+    // selection and control clicks keep their defaults, but no part of a
+    // canvas touch sequence should reach the host's command gesture handler.
+    const control = target.closest?.('input, textarea, select, button, a, [contenteditable]:not([contenteditable="false"])');
+    if (!control && event.cancelable && (event.type === 'touchstart' || event.type === 'touchmove')) event.preventDefault();
+    event.stopPropagation();
+  };
+  private documentPointer = (event: PointerEvent): void => {
+    if (event.pointerId !== this.pencilPointer || this.host.contains(event.target as Node)) return;
+    if (event.type === 'pointermove') this.pointerMove(event);
+    else if (event.type === 'pointerup') this.pointerUp(event);
+    else this.pointerCancel(event);
+  };
+  private lostPointerCapture = (event: PointerEvent): void => {
+    if (event.pointerId === this.pencilPointer) {
+      this.capture(event);
+      return;
+    }
+    this.pointerCancel(event);
+  };
   private sample(event: PointerEvent, rect?: DOMRect): Point {
     const point = this.toPage(rect ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : this.local(event));
     return { ...point, pressure: event.pointerType === 'pen' ? clamp(event.pressure || 0.35, 0.05, 1) : 0.5, time: event.timeStamp };
@@ -667,10 +711,14 @@ export class InkEngine {
   private pointerDown = (event: PointerEvent): void => {
     if(this.wheelPull)this.cancelPagePull();
     if (event.button !== 0 && event.button !== 5) return;
-    event.preventDefault(); this.capture(event);
+    event.preventDefault(); event.stopPropagation(); this.capture(event);
     const local = this.local(event);
     if (this.pagePull && this.pagePull.pointerId !== event.pointerId) this.cancelPagePull();
     if (event.pointerType === 'pen') {
+      // A new physical contact also terminates a stale stream whose up event
+      // never reached the WebView; never connect separate Pencil strokes.
+      if (this.pencilPointer !== null) { this.finishActive(); this.finishErase(); }
+      this.pencilPointer = event.pointerId;
       this.cancelPagePull();
       // Pencil takes priority over any finger contact already on the glass.
       if (this.active && this.touches.has(this.active.pointerId)) { this.active = null; this.clear(this.liveContext); }
@@ -721,7 +769,7 @@ export class InkEngine {
   };
 
   private pointerMove = (event: PointerEvent): void => {
-    event.preventDefault();
+    event.preventDefault(); event.stopPropagation();
     this.hover = event.pointerType === 'touch' ? null : this.local(event); this.positionEraserCursor();
     if (this.lasso?.pointerId === event.pointerId) {
       const point = this.sample(event);
@@ -754,7 +802,9 @@ export class InkEngine {
       }
       let samples: PointerEvent[] = [];
       try { samples = event.getCoalescedEvents?.() ?? []; } catch { /* Older WebKit may expose an unsupported method. */ }
-      if (!samples.length) samples = [event];
+      // Some WebKit batches omit the dispatched event's latest position.
+      // The distance/timestamp checks below deduplicate it when it is included.
+      samples = [...samples, event];
       const stroke = this.active.stroke;
       const rect = this.host.getBoundingClientRect();
       this.clipped(this.liveContext, () => {
@@ -799,6 +849,7 @@ export class InkEngine {
   };
 
   private pointerUp = (event: PointerEvent): void => {
+    event.stopPropagation();
     let advance = false;
     if (this.pagePull?.pointerId === event.pointerId) {
       this.pointerMove(event);
@@ -810,9 +861,11 @@ export class InkEngine {
     if (this.erase?.pointerId === event.pointerId) { this.eraseTo(this.sample(event)); this.finishErase(); }
     this.touches.delete(event.pointerId);
     if (this.pan?.pointerId === event.pointerId) this.pan = null;
+    if (event.pointerId === this.pencilPointer) this.pencilPointer = null;
     if (advance) this.options.onPageAdvance?.();
   };
   private pointerCancel = (event: PointerEvent): void => {
+    event.stopPropagation();
     if (this.pagePull?.pointerId === event.pointerId) this.cancelPagePull();
     if (this.lasso?.pointerId === event.pointerId || this.drag?.pointerId === event.pointerId) this.finishSelection(true);
     // Keep the real samples received before an OS interruption; no predicted points are persisted.
@@ -820,6 +873,7 @@ export class InkEngine {
     if (this.erase?.pointerId === event.pointerId) this.finishErase();
     this.touches.delete(event.pointerId);
     if (this.pan?.pointerId === event.pointerId) this.pan = null;
+    if (event.pointerId === this.pencilPointer) this.pencilPointer = null;
   };
   private finishActive(convertShape = false): void {
     if (!this.active) return;

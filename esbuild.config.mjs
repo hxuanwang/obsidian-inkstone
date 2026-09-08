@@ -1,6 +1,7 @@
 import * as esbuild from 'esbuild';
 const demo = process.argv.includes('--demo');
 const options = {
+  loader: { '.aff': 'text', '.dic': 'text' },
   entryPoints: [demo ? 'src/demo.ts' : 'src/main.ts'], bundle: true,
   outfile: demo ? 'demo/app.js' : 'main.js',
   format: demo ? 'iife' : 'cjs', target: 'es2022',

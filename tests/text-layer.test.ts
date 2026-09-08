@@ -172,3 +172,62 @@ test('paper changes cancel pending insertion and text dragging clamps to landsca
     assert.equal(changes.at(-1)![0].y, 1200);
   });
 });
+
+import type { SpellingDictionary } from '../src/spelling';
+const dictionary = { misspellings: (text: string) => [...text.matchAll(/\bheello\b/g)].map(match => ({ start: match.index!, end: match.index! + match[0].length, word: match[0] })) } as SpellingDictionary;
+async function withSpellingLayer(loader: () => Promise<SpellingDictionary>, run: (state: { layer: TextLayer; surface: Element; input: () => Element }) => Promise<void>) {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { createElement: (tag: string) => new Element(tag), createTextNode: (text: string) => Object.assign(new Element('#text'), {textContent: text}) } });
+  const surface = new Element();
+  const layer = new TextLayer(surface as unknown as HTMLElement, () => ({ x: 0, y: 0, zoom: 1 }), () => {}, () => '#123456', loader);
+  try { layer.setBoxes([box({ text: 'heello world' })]); await run({ layer, surface, input: () => surface.querySelector('textarea')! }); }
+  finally { layer.destroy(); if (descriptor) Object.defineProperty(globalThis, 'document', descriptor); else Reflect.deleteProperty(globalThis, 'document'); }
+}
+const settle = () => new Promise<void>(resolve => setImmediate(resolve));
+
+test('typed spelling lazily loads once, coexists with search, follows scroll and clears when disabled', async () => {
+  let loads = 0;
+  await withSpellingLayer(async () => { loads++; return dictionary; }, async ({ layer, surface, input }) => {
+    assert.equal(loads, 0);
+    layer.setSpellcheck(true); layer.setSpellcheck(true); await settle();
+    assert.equal(loads, 1);
+    layer.setQuery('heello');
+    const mirror = surface.querySelector('.inkstone-text-highlight-content')!;
+    assert.equal(mirror.querySelectorAll('.inkstone-spelling-word').length, 1);
+    assert.equal(mirror.querySelectorAll('mark').length, 1);
+    input().scrollTop = 45; input().scrollLeft = 8; input().clientWidth = 405;
+    input().dispatchEvent(new Event('scroll'));
+    assert.equal(mirror.style.transform, 'translate(-8px,-45px)');
+    assert.equal(mirror.style.width, '405px');
+    layer.setSpellcheck(false);
+    assert.equal(mirror.querySelectorAll('.inkstone-spelling-word').length, 0);
+    assert.equal(mirror.querySelectorAll('mark').length, 1, 'disabling spelling preserves search matches');
+  });
+});
+
+test('typed spelling checks the latest edit after debounce and removes corrected underlines', async () => {
+  await withSpellingLayer(async () => dictionary, async ({ layer, surface, input }) => {
+    layer.setSpellcheck(true); await settle();
+    const mirror = surface.querySelector('.inkstone-text-highlight-content')!;
+    assert.equal(mirror.querySelectorAll('.inkstone-spelling-word').length, 1);
+    input().value = 'heello again'; input().dispatchEvent(new Event('input'));
+    assert.equal(mirror.querySelectorAll('.inkstone-spelling-word').length, 0, 'stale underlines are removed immediately');
+    await new Promise(resolve => setTimeout(resolve, 280));
+    assert.equal(mirror.querySelectorAll('.inkstone-spelling-word').length, 1);
+    input().value = 'hello again'; input().dispatchEvent(new Event('input'));
+    await new Promise(resolve => setTimeout(resolve, 280));
+    assert.equal(mirror.querySelectorAll('.inkstone-spelling-word').length, 0);
+  });
+});
+
+test('late dictionary loading cannot revive spelling after disable or destroy', async () => {
+  for (const action of ['disable', 'destroy']) {
+    let resolve!: (dictionary: SpellingDictionary) => void;
+    await withSpellingLayer(() => new Promise(done => { resolve = done; }), async ({ layer, surface }) => {
+      layer.setSpellcheck(true);
+      if (action === 'disable') layer.setSpellcheck(false); else layer.destroy();
+      resolve(dictionary); await settle();
+      assert.equal(surface.querySelectorAll('.inkstone-spelling-word').length, 0, action);
+    });
+  }
+});

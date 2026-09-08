@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const bundle = await build({
+  loader: { '.aff': 'text', '.dic': 'text' },
   absWorkingDir: root, entryPoints: ['tests/browser-fixture.ts'], bundle: true,
   format: 'iife', target: 'es2022', write: false, logLevel: 'info',
 });

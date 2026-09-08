@@ -129,6 +129,7 @@
 .inkstone-text-highlight-overlay{position:absolute;inset:0;overflow:hidden;pointer-events:none}
 .inkstone-text-highlight-overlay[hidden]{display:none}
 .inkstone-text-highlight-content{padding:6px;white-space:pre-wrap;overflow-wrap:break-word;color:transparent;font:inherit;line-height:1.35}
+.inkstone-text-highlight-content .inkstone-spelling-word{text-decoration-line:underline;text-decoration-style:wavy;text-decoration-color:#d93939;text-decoration-thickness:1.5px;text-underline-offset:3px;text-decoration-skip-ink:none}
 .inkstone-text-highlight-content .inkstone-search-mark{padding:0;border-radius:2px;background:#f9cf88;color:transparent}
 .inkstone-page-text-input{position:relative}
 .inkstone-text-layer.is-editing .inkstone-text-box{border-color:#6ba5d1;pointer-events:auto}
@@ -211,7 +212,7 @@
 
 @media(prefers-contrast:more){.inkstone-editor{--ink-line:var(--text-muted,#68707c)}.inkstone-editor .inkstone-button{border-color:var(--ink-line)}}
 /* Pull beyond the paper: compositor-only lift reveals the next-page affordance. */
-.inkstone-surface>canvas,.inkstone-surface>.inkstone-text-layer,.inkstone-surface>.inkstone-search-highlights{translate:0 var(--ink-pull-lift,0px)}
+.inkstone-surface>canvas,.inkstone-surface>.inkstone-text-layer,.inkstone-surface>.inkstone-search-highlights,.inkstone-surface>.inkstone-spelling-layer{translate:0 var(--ink-pull-lift,0px)}
 .inkstone-page-pull{bottom:0;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:.35em;padding:.6em 0 0;border:0;border-radius:0;background:transparent;color:var(--ink-muted);box-shadow:none;overflow:hidden;white-space:normal;font-size:var(--font-ui-small,13px);pointer-events:none}
 .inkstone-page-pull::before{content:none}
 .inkstone-pull-arrow{font-size:1.8em;line-height:1;color:var(--ink-accent)}
@@ -221,7 +222,7 @@
 .inkstone-page-pull[data-ready=true] .inkstone-pull-ring{color:var(--ink-accent)}
 .inkstone-pull-label{line-height:1.4;text-align:center}
 .inkstone-editor svg.inkstone-pull-preview{width:100%;height:150px;min-height:150px;margin-top:1.2em;opacity:.75;border:1px solid var(--ink-line);box-shadow:0 0 6px #0001}
-@media(prefers-reduced-motion:reduce){.inkstone-surface>canvas,.inkstone-surface>.inkstone-text-layer,.inkstone-surface>.inkstone-search-highlights{translate:none}.inkstone-page-pull{background:var(--ink-bg)}}
+@media(prefers-reduced-motion:reduce){.inkstone-surface>canvas,.inkstone-surface>.inkstone-text-layer,.inkstone-surface>.inkstone-search-highlights,.inkstone-surface>.inkstone-spelling-layer{translate:none}.inkstone-page-pull{background:var(--ink-bg)}}
 
 /* One fixed toolbar, with a contextual palette floating over the paper. */
 .inkstone-header{flex-wrap:nowrap;min-width:0;gap:.25em}
@@ -330,3 +331,5 @@
 .inkstone-page-popover{position:absolute;z-index:15;display:flex;flex-direction:column;gap:3px;width:min(270px,calc(100% - 16px));max-height:calc(100% - 16px);overflow:auto;padding:12px;border:1px solid var(--ink-line);border-radius:12px;background:var(--ink-panel);box-shadow:0 8px 32px #0003}
 .inkstone-page-popover .inkstone-button{justify-content:flex-start;flex-shrink:0}
 .inkstone-page-popover>strong{padding:4px 6px}
+.inkstone-spelling-layer{position:absolute;left:0;top:0;transform-origin:0 0;pointer-events:none;overflow:hidden;z-index:3}
+.inkstone-ink-spelling-mark{position:absolute;height:6px;pointer-events:none;background:repeat-x left top/12px 6px url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='6'%3E%3Cpath d='M0 3Q3 0 6 3T12 3' fill='none' stroke='%23dc3545' stroke-width='1.5'/%3E%3C/svg%3E")}

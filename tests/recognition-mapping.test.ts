@@ -40,7 +40,7 @@ import { type createWorker, type Worker } from 'tesseract.js';
 // accuracy; the browser smoke test separately runs the real bundled engine.
 function fakeCanvasDocument() {
   return { createElement: () => ({ width: 0, height: 0, getContext: () => ({
-    fillRect() {}, translate() {}, beginPath() {}, arc() {}, fill() {}, moveTo() {}, lineTo() {}, stroke() {},
+    fillRect() {}, scale() {}, translate() {}, beginPath() {}, arc() {}, fill() {}, moveTo() {}, lineTo() {}, stroke() {},
   }) }) } as unknown as Document;
 }
 function inkPage() {
@@ -160,9 +160,78 @@ test('OCR crops and maps landscape ink with the dimensions captured when submitt
     const job = recognizer.recognize(page);
     page.orientation = 'portrait';
     const result = await job;
-    assert.deepEqual(submittedSize, [70, 70]);
-    assert.deepEqual(result.words, [{ text: 'EDGE', x: 1866, y: 1266, width: 114, height: 134 }]);
+    assert.deepEqual(submittedSize, [140, 140]);
+    assert.deepEqual(result.words, [{ text: 'EDGE', x: 1865.5, y: 1265.5, width: 99.5, height: 99.5 }]);
     assert.deepEqual(mapRecognitionWords(blocks([{ text: 'low', bbox: { x0: 0, y0: 0, x1: 30, y1: 30 } }]), 100, 1950, { pageSize: 'a4' }),
       [{ text: 'low', x: 100, y: 1950, width: 30, height: 30 }]);
+  } finally { await recognizer.destroy(); globalThis.document = original; }
+});
+
+import { renderRecognitionCrop } from '../src/recognition';
+
+test('small ink is rerendered at twice the resolution with a border at page edges', () => {
+  const original = globalThis.document; globalThis.document = fakeCanvasDocument();
+  try {
+    const page = inkPage(); page.strokes[0].points[0].x = 0; page.strokes[0].points[0].y = 0;
+    const crop = renderRecognitionCrop(page.strokes);
+    assert.equal(crop.scale, 2);
+    assert.equal(crop.left, -32); assert.equal(crop.top, -32);
+    assert.deepEqual([crop.canvas.width, crop.canvas.height], [134, 134]);
+    assert.deepEqual(mapRecognitionWords(blocks([{ text: 'edge', bbox: { x0: 60, y0: 60, x1: 100, y1: 100 } }]), crop.left, crop.top, {}, crop.scale),
+      [{ text: 'edge', x: 0, y: 0, width: 18, height: 18 }]);
+    assert.deepEqual(mapRecognitionWords(blocks([{ text: 'invalid', bbox: { x0: 0, y0: 0, x1: 10, y1: 10 } }]), 0, 0, {}, 0), []);
+  } finally { globalThis.document = original; }
+});
+
+test('highlighters do not enlarge OCR crops and full-page rasters stay under six million pixels', () => {
+  const original = globalThis.document; globalThis.document = fakeCanvasDocument();
+  try {
+    const page = inkPage();
+    const before = renderRecognitionCrop(page.strokes);
+    page.strokes.push({ ...page.strokes[0], id: 'highlight', tool: 'highlighter', points: [{ x: 1300, y: 1800, pressure: .5, time: 0 }] });
+    const after = renderRecognitionCrop(page.strokes);
+    assert.deepEqual([after.left, after.top, after.canvas.width, after.canvas.height], [before.left, before.top, before.canvas.width, before.canvas.height]);
+    const full = renderRecognitionCrop([{ ...page.strokes[0], points: [{ x: 0, y: 0, pressure: .5, time: 0 }, { x: 1980, y: 1400, pressure: .5, time: 1 }] }], { pageSize: 'a4', orientation: 'landscape' });
+    assert.ok(full.canvas.width * full.canvas.height <= 6_000_000);
+    assert.ok(full.scale > 1 && full.scale < 2);
+    const mapped = mapRecognitionWords(blocks([{ text: 'large', bbox: { x0: 100 * full.scale, y0: 120 * full.scale, x1: 200 * full.scale, y1: 150 * full.scale } }]), full.left, full.top, { pageSize: 'a4', orientation: 'landscape' }, full.scale)[0];
+    assert.ok(Math.abs(mapped.x - 68) < 1e-9); assert.ok(Math.abs(mapped.width - 100) < 1e-9);
+  } finally { globalThis.document = original; }
+});
+
+test('low-confidence OCR tries paragraph layout once, keeps the better word boxes, then resets for the next page', async () => {
+  const original = globalThis.document; globalThis.document = fakeCanvasDocument();
+  const layouts: unknown[] = [];
+  let calls = 0;
+  const results = [
+    { text: 'hcllo', confidence: 30, blocks: null },
+    { text: 'hello', confidence: 82, blocks: blocks([{ text: 'hello', bbox: { x0: 60, y0: 60, x1: 100, y1: 100 } }]) },
+    { text: 'second', confidence: 90, blocks: null },
+  ];
+  const factory: typeof createWorker = async () => fakeWorker({
+    setParameters: (async parameters => { layouts.push(parameters.tessedit_pageseg_mode); return {}; }) as Worker['setParameters'],
+    recognize: (async () => ({ data: results[calls++] })) as unknown as Worker['recognize'],
+  });
+  const recognizer = new LocalRecognizer('/ocr', factory, 1000);
+  try {
+    const result = await recognizer.recognize(inkPage());
+    assert.equal(result.text, 'hello');
+    assert.deepEqual(result.words, [{ text: 'hello', x: 75, y: 75, width: 20, height: 20 }]);
+    assert.equal((await recognizer.recognize(inkPage())).text, 'second');
+    assert.deepEqual(layouts, ['11', '6', '11']);
+    assert.equal(calls, 3, 'High confidence output needs no extra pass');
+  } finally { await recognizer.destroy(); globalThis.document = original; }
+});
+
+test('a worse alternate layout cannot replace the original OCR transcript', async () => {
+  const original = globalThis.document; globalThis.document = fakeCanvasDocument();
+  let calls = 0;
+  const factory: typeof createWorker = async () => fakeWorker({ recognize: (async () => ({ data: ++calls === 1
+    ? { text: 'original', confidence: 50, blocks: null }
+    : { text: 'worse', confidence: 15, blocks: null } })) as unknown as Worker['recognize'] });
+  const recognizer = new LocalRecognizer('/ocr', factory, 1000);
+  try {
+    assert.equal((await recognizer.recognize(inkPage())).text, 'original');
+    assert.equal(calls, 2);
   } finally { await recognizer.destroy(); globalThis.document = original; }
 });
