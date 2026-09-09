@@ -361,3 +361,29 @@
 
 .inkstone-paste-selection{display:none!important}
 [data-tool="lasso"] .inkstone-paste-selection{display:flex!important}
+
+/* Mode-specific controls stay together in the floating palette. */
+.inkstone-writing-tools,.inkstone-text-settings{display:flex;align-items:center;gap:.3em}
+.inkstone-writing-tools{padding-right:.5em;border-right:1px solid var(--ink-line)}
+.inkstone-toolbar:not([data-tool=text]) .inkstone-text-settings{display:none}
+.inkstone-toolbar[data-tool=text]>:not(.inkstone-text-settings){display:none}
+.inkstone-toolbar[data-tool=lasso] .inkstone-colors,
+.inkstone-toolbar[data-tool=lasso] .inkstone-size-presets,
+.inkstone-toolbar[data-tool=lasso] .inkstone-weight{display:none}
+.inkstone-text-settings{flex-wrap:wrap;justify-content:center;max-width:100%;gap:.4em}
+.inkstone-text-settings select{width:auto;max-width:10em;min-height:var(--ink-control);border-radius:8px}
+.inkstone-text-settings input[type=color]{width:var(--ink-control);height:var(--ink-control);padding:5px;border:1px solid var(--ink-line);border-radius:50%;background:transparent;cursor:pointer}
+.inkstone-text-settings input[type=color]::-webkit-color-swatch-wrapper{padding:0}
+.inkstone-text-settings input[type=color]::-webkit-color-swatch{border:0;border-radius:50%}
+.inkstone-text-settings button{min-width:var(--ink-control);min-height:var(--ink-control)}
+.inkstone-writing-tools[hidden]{display:none}
+@container inkstone (max-width:520px){
+  .inkstone-primary-tools .inkstone-button>span{display:none}
+  .inkstone-toolbar .inkstone-colors{gap:.2em}
+  .inkstone-writing-tools{padding-right:.25em;gap:.1em}
+}
+.inkstone-text-settings button{border:0;border-radius:8px;background:transparent;color:var(--ink-text);cursor:pointer}
+.inkstone-text-settings button:hover{background:var(--background-modifier-hover,#e9edf0)}
+.inkstone-text-settings button[aria-pressed=true]{background:var(--background-modifier-active-hover,#d7eef5);color:var(--text-accent,#173849)}
+.inkstone-text-bold{font-weight:700}.inkstone-text-italic{font-style:italic}
+.inkstone-navigation,.inkstone-header-actions{flex:0 0 auto}

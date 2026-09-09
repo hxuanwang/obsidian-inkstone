@@ -231,3 +231,38 @@ test('late dictionary loading cannot revive spelling after disable or destroy', 
     });
   }
 });
+
+test('floating text settings edit the selected box in place and carry style to fresh boxes', () => {
+  withLayer(({ layer, surface, changes, input }) => {
+    const toolbar = layer.getToolbar() as unknown as Element;
+    const control = (label: string) => toolbar.querySelectorAll('select').concat(toolbar.querySelectorAll('button'), toolbar.querySelectorAll('input')).find(node => node.attributes['aria-label'] === label)!;
+    const original = input();
+    original.dispatchEvent(new Event('focus'));
+    control('Text font size').value = '48'; control('Text font size').dispatchEvent(new Event('change'));
+    control('Bold').dispatchEvent(new Event('click'));
+    control('Text alignment').value = 'center'; control('Text alignment').dispatchEvent(new Event('change'));
+    control('Text line spacing').value = '1.5'; control('Text line spacing').dispatchEvent(new Event('change'));
+    assert.equal(input(), original, 'formatting keeps the textarea and its native selection intact');
+    assert.equal(changes.at(-1)![0].fontSize, 48); assert.equal(changes.at(-1)![0].bold, true);
+    assert.equal(changes.at(-1)![0].textAlign, 'center'); assert.equal(changes.at(-1)![0].lineHeight, 1.5);
+    assert.equal(control('Bold').attributes['aria-pressed'], 'true');
+    pointer(surface, 'pointerdown', 700, 700); pointer(surface, 'pointerup', 700, 700);
+    const added = changes.at(-1)![1];
+    assert.notEqual(added.id, 'text-1'); assert.equal(added.text, ''); assert.equal(added.fontSize, 48);
+    assert.equal(added.bold, true); assert.equal(added.textAlign, 'center');
+    assert.equal(surface.querySelectorAll('select').length, 0, 'box controls only contain Move and Remove');
+  });
+});
+
+test('selecting a legacy text box resets formatting controls and changing pages clears selection', () => {
+  withLayer(({ layer, input, changes }) => {
+    const toolbar = layer.getToolbar() as unknown as Element;
+    const bold = toolbar.querySelectorAll('button').find(node => node.attributes['aria-label'] === 'Bold')!;
+    layer.setBoxes([box({ bold: true, fontFamily: 'serif' }), box({ id: 'legacy' })]);
+    input().dispatchEvent(new Event('focus')); assert.equal(bold.attributes['aria-pressed'], 'true');
+    layer.setBoxes([box({ id: 'legacy' })]);input().dispatchEvent(new Event('focus'));
+    assert.equal(bold.attributes['aria-pressed'], 'false');
+    layer.setBoxes([]);bold.dispatchEvent(new Event('click'));
+    assert.equal(changes.length, 0, 'setting defaults after page replacement must not edit the previous page');
+  });
+});

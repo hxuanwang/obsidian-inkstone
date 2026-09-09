@@ -58,7 +58,9 @@ export function isImageSource(value: unknown): value is string {
 }
 export type RecognitionWord = { text: string; x: number; y: number; width: number; height: number };
 export type PageRecognition = { transcript: string; inkSignature: string; words: RecognitionWord[] };
-export type TextBox = { id: string; x: number; y: number; width: number; height: number; fontSize: number; color: string; text: string };
+export const TEXT_FONTS = { sans: 'Arial, sans-serif', serif: 'Georgia, serif', mono: 'Courier New, monospace' } as const;
+export type TextStyle = { fontFamily?: keyof typeof TEXT_FONTS; bold?: boolean; italic?: boolean; textAlign?: 'left' | 'center' | 'right'; lineHeight?: number };
+export type TextBox = TextStyle & { id: string; x: number; y: number; width: number; height: number; fontSize: number; color: string; text: string };
 export type InkPage = PageFormat & { id: string; title: string; paper: Paper; strokes: Stroke[]; text: string; transcript: string; recognition?: PageRecognition; textBoxes?: TextBox[]; images?: PageImage[]; favorite?: boolean; outline?: boolean };
 export type InkDocument = { version: 2; pages: InkPage[] };
 export const MAX_PAGES = 500;
@@ -111,9 +113,17 @@ export function parseDocument(text: string): InkDocument {
           box.x < 0 || box.y < 0 || box.width < 80 || box.height < 40 || box.x + box.width > pageWidth || box.y + box.height > pageHeight ||
           box.fontSize < 12 || box.fontSize > 96 || typeof box.color !== 'string' || !/^#[0-9a-f]{6}$/i.test(box.color) ||
           typeof box.text !== 'string' || box.text.length > MAX_TEXT_LENGTH) throw new Error('The page contains an invalid text box.');
+        if ((box.fontFamily !== undefined && (typeof box.fontFamily !== 'string' || !Object.prototype.hasOwnProperty.call(TEXT_FONTS, box.fontFamily))) ||
+          (box.bold !== undefined && typeof box.bold !== 'boolean') || (box.italic !== undefined && typeof box.italic !== 'boolean') ||
+          (box.textAlign !== undefined && !['left', 'center', 'right'].includes(box.textAlign as string)) ||
+          (box.lineHeight !== undefined && (!finite(box.lineHeight) || box.lineHeight < 1 || box.lineHeight > 2))) throw new Error('The page contains invalid text formatting.');
         textIds.add(box.id); length += box.text.length;
         if (length > MAX_TEXT_LENGTH) throw new Error('The page contains too much text.');
-        return {id:box.id, x:box.x, y:box.y, width:box.width, height:box.height, fontSize:box.fontSize, color:box.color, text:box.text};
+        return {id:box.id, x:box.x, y:box.y, width:box.width, height:box.height, fontSize:box.fontSize, color:box.color, text:box.text,
+          ...(box.fontFamily !== undefined ? {fontFamily: box.fontFamily as keyof typeof TEXT_FONTS} : {}),
+          ...(box.bold !== undefined ? {bold: box.bold as boolean} : {}), ...(box.italic !== undefined ? {italic: box.italic as boolean} : {}),
+          ...(box.textAlign !== undefined ? {textAlign: box.textAlign as TextBox['textAlign']} : {}),
+          ...(box.lineHeight !== undefined ? {lineHeight: box.lineHeight as number} : {})};
       });
     }
     let images: PageImage[] | undefined;

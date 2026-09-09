@@ -95,6 +95,9 @@ export class InkEditor {
   private closePageOptions?: () => void;
   private toolButtons = new Map<Tool, HTMLButtonElement>();
   private selectedTool: Tool = 'pen';
+  private lastWritingTool: Tool = 'pen';
+  private writingButton!: HTMLButtonElement;
+  private writingTools!: HTMLElement;
   private previousTool: Tool = 'highlighter';
   private writingTool: Tool = 'pen';
   private pencilPalette!: HTMLElement;
@@ -173,17 +176,27 @@ export class InkEditor {
     header.append(navigation, actions);
 
     const workspace = el('div', 'inkstone-workspace');
-    const toolbar = this.floatingPalette = el('div', 'inkstone-toolbar'); toolbar.setAttribute('role', 'group'); toolbar.setAttribute('aria-label', 'Tool settings');
+    const toolbar = this.floatingPalette = el('div', 'inkstone-toolbar'); toolbar.setAttribute('role', 'group'); toolbar.setAttribute('aria-label', 'Writing settings'); toolbar.dataset.tool = 'pen';
     const history = el('div', 'inkstone-tool-group');
     this.undoButton = this.button('undo', 'Undo (⌘Z)', () => this.undo());
     this.redoButton = this.button('redo', 'Redo (⇧⌘Z)', () => this.redo());
     history.append(this.undoButton, this.redoButton);
-    const tools = el('div', 'inkstone-primary-tools'); tools.setAttribute('role', 'group'); tools.setAttribute('aria-label', 'Writing tools');
-    for (const [tool, label] of [['pen', 'Pen'], ['highlighter', 'Highlighter'], ['eraser', 'Eraser'], ['lasso', 'Lasso selection'], ['shape', 'Shape recognition'], ['hand', 'Move page'], ['text', 'Text tool']] as const) {
+    const tools = el('div', 'inkstone-primary-tools'); tools.setAttribute('role', 'group'); tools.setAttribute('aria-label', 'Editor modes');
+    this.writingButton = this.button('pen', 'Writing', () => this.selectTool(this.lastWritingTool));
+    this.writingButton.setAttribute('aria-pressed', 'true'); tools.append(this.writingButton);
+    this.writingTools = el('div', 'inkstone-writing-tools');
+    this.writingTools.setAttribute('role', 'group'); this.writingTools.setAttribute('aria-label', 'Writing tools');
+    for (const [tool, label] of [['pen', 'Pen'], ['highlighter', 'Highlighter'], ['shape', 'Shape recognition']] as const) {
       const button = this.button(tool, label, () => this.selectTool(tool));
       button.setAttribute('aria-pressed', String(tool === 'pen'));
+      button.dataset.tool = tool; this.toolButtons.set(tool, button); this.writingTools.append(button);
+    }
+    for (const [tool, label] of [['eraser', 'Eraser'], ['lasso', 'Lasso selection'], ['hand', 'Move page'], ['text', 'Text']] as const) {
+      const button = this.button(tool, label, () => this.selectTool(tool));
+      button.setAttribute('aria-pressed', 'false');
       button.dataset.tool = tool; this.toolButtons.set(tool, button); tools.append(button);
     }
+    toolbar.append(this.writingTools);
     const imageButton = this.button('image', 'Insert image', () => {
       if (this.closeImagePicker) { this.closeImagePicker(); return; }
       const pageId = this.activePageId, lifecycle = this.lifecycle;
@@ -387,6 +400,7 @@ export class InkEditor {
       this.lastTextEdit=now;this.textRedo=[];
       this.updatePage({textBoxes:boxes});this.updateState(this.getActivePage());
     },()=>this.color);
+    toolbar.append(this.textLayer.getToolbar());
     this.handwritingSpelling = new HandwritingSpelling(surface,()=>this.engine.getViewport());
     this.engine.setPages(this.document.pages);
     this.engine.setColor(this.color); this.engine.setWidth(this.widths.pen);
@@ -430,6 +444,11 @@ export class InkEditor {
     this.selectionSelect.hidden=tool!=='lasso';
     this.floatingPalette.hidden=['hand'].includes(tool);
     this.floatingPalette.dataset.tool=tool;
+    const writing = ['pen', 'highlighter', 'shape'].includes(tool);
+    if (writing) this.lastWritingTool = tool;
+    this.writingButton.setAttribute('aria-pressed', String(writing));
+    this.writingTools.hidden = !writing;
+    this.floatingPalette.setAttribute('aria-label', tool === 'text' ? 'Text settings' : writing ? 'Writing settings' : tool === 'eraser' ? 'Eraser settings' : 'Selection settings');
     this.selectedTool = tool; this.engine.setTool(tool === 'text' ? 'hand' : tool); this.textLayer.setEnabled(tool==='text');this.root.classList.toggle('inkstone-text-tool',tool==='text');
     this.hint.textContent=tool==='text'?'Tap the page to type. Drag Move to position text.':tool==='shape'?'Choose a shape and drag to draw.':tool==='lasso'?'Drag a rectangle or choose Freehand lasso. Drag selected objects to move; use corners to resize.':'Pencil writes. Fingers move.';
     if (tool === 'pen' || tool === 'highlighter' || tool === 'shape') { this.color = this.toolColors[tool === 'highlighter' ? 'highlighter' : 'pen']; this.engine.setColor(this.color); }

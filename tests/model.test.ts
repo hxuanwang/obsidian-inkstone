@@ -192,3 +192,13 @@ test('format resizing keeps full-page images and minimum-size text within every 
     }
   }
 });
+
+test('text typography round trips while invalid and injected formatting is rejected', () => {
+  const document = createDocument();
+  const box = {id:'styled',x:0,y:0,width:420,height:200,fontSize:28,color:'#123456',text:'Styled text',fontFamily:'serif' as const,bold:true,italic:true,textAlign:'center' as const,lineHeight:1.5};
+  document.pages[0].textBoxes=[box];
+  assert.deepEqual(parse(document),document);
+  for (const patch of [{fontFamily:'__proto__'},{fontFamily:'Arial; color:red'},{bold:'true'},{italic:1},{textAlign:'justify'},{lineHeight:0},{lineHeight:2.1}]) {
+    assert.throws(()=>parse({...document,pages:[{...document.pages[0],textBoxes:[{...box,...patch}]}]}), /invalid text formatting/);
+  }
+});
