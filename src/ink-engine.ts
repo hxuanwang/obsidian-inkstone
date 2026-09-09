@@ -1,6 +1,6 @@
 import { type InkPage as InkDocument, type PageFormat, type Paper, type PageImage, type Point, type Stroke, isImageSource, MAX_PAGE_IMAGES, pageDimensions, formatPage } from './model';
 import { eraseStroke, type EraserMode } from './eraser';
-import { createShape, type ShapeMode, pointInPolygon, enclosedStrokes, recognizeShape } from './geometry';
+import { createShape, type ShapeMode, pointInPolygon, enclosedStrokes, recognizeShape, smoothInkSegment, inkSegmentOutline } from './geometry';
 import { drawPaper, paperSvg } from './paper';
 export { PAGE_HEIGHT, PAGE_WIDTH } from './model';
 
@@ -528,21 +528,22 @@ export class InkEngine {
     context.arc(point.x, point.y, r, 0, Math.PI * 2);
     context.fill();
     if (!previous) return;
-    const length = distance(previous, point);
-    if (length < 0.001) return;
-    const previousRadius = radius(stroke, previous);
-    const nx = -(point.y - previous.y) / length;
-    const ny = (point.x - previous.x) / length;
+    const outline = inkSegmentOutline(previous, radius(stroke, previous), point, r);
+    if (!outline.length) return;
     context.beginPath();
-    context.moveTo(previous.x + nx * previousRadius, previous.y + ny * previousRadius);
-    context.lineTo(point.x + nx * r, point.y + ny * r);
-    context.lineTo(point.x - nx * r, point.y - ny * r);
-    context.lineTo(previous.x - nx * previousRadius, previous.y - ny * previousRadius);
+    context.moveTo(outline[0].x, outline[0].y);
+    for (const vertex of outline.slice(1)) context.lineTo(vertex.x, vertex.y);
     context.closePath(); context.fill();
+  }
+  private drawSample(context: CanvasRenderingContext2D, stroke: Stroke, index: number): void {
+    let previous = stroke.points[index - 1];
+    for (const point of smoothInkSegment(stroke.points[index], previous, stroke.points[index - 2])) {
+      this.drawSegment(context, stroke, point, previous); previous = point;
+    }
   }
   private drawStroke(context: CanvasRenderingContext2D, stroke: Stroke): void {
     this.clipped(context, () => {
-      for (let index = 0; index < stroke.points.length; index++) this.drawSegment(context, stroke, stroke.points[index], stroke.points[index - 1]);
+      for (let index = 0; index < stroke.points.length; index++) this.drawSample(context, stroke, index);
     });
   }
   private paper(page: InkDocument): void {
@@ -814,7 +815,7 @@ export class InkEngine {
           if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || point.time < previous.time || distance(previous, point) < 0.1) continue;
           // Stabilize pressure without delaying the spatial Pencil samples.
           point.pressure = previous.pressure * 0.35 + point.pressure * 0.65;
-          stroke.points.push(point); this.drawSegment(this.liveContext, stroke, point, previous);
+          stroke.points.push(point); this.drawSample(this.liveContext, stroke, stroke.points.length - 1);
         }
       });
       return;
@@ -958,12 +959,16 @@ export class InkEngine {
       const color = /^#[0-9a-f]{6}$/i.test(stroke.color) ? stroke.color : '#243247';
       parts.push(`<g fill="${color}" opacity="${stroke.tool === 'highlighter' ? 0.28 : 1}">`);
       for (let index = 0; index < stroke.points.length; index++) {
-        const point = stroke.points[index]; const r = radius(stroke, point);
-        parts.push(`<circle cx="${n(point.x)}" cy="${n(point.y)}" r="${n(r)}"/>`);
-        if (!index) continue;
-        const previous = stroke.points[index - 1]; const length = distance(previous, point); if (length < 0.001) continue;
-        const pr = radius(stroke, previous), nx = -(point.y - previous.y) / length, ny = (point.x - previous.x) / length;
-        parts.push(`<path d="M${n(previous.x + nx * pr)} ${n(previous.y + ny * pr)}L${n(point.x + nx * r)} ${n(point.y + ny * r)}L${n(point.x - nx * r)} ${n(point.y - ny * r)}L${n(previous.x - nx * pr)} ${n(previous.y - ny * pr)}Z"/>`);
+        let previous = stroke.points[index - 1];
+        for (const point of smoothInkSegment(stroke.points[index], previous, stroke.points[index - 2])) {
+          const r = radius(stroke, point);
+          parts.push(`<circle cx="${n(point.x)}" cy="${n(point.y)}" r="${n(r)}"/>`);
+          if (previous) {
+            const outline = inkSegmentOutline(previous, radius(stroke, previous), point, r);
+            if (outline.length) parts.push(`<path d="${outline.map((p, i) => `${i ? 'L' : 'M'}${n(p.x)} ${n(p.y)}`).join('')}Z"/>`);
+          }
+          previous = point;
+        }
       }
       parts.push('</g>');
     }

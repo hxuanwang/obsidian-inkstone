@@ -56,3 +56,18 @@ test('late recognition cannot alter a replacement document', async () => {
   assert.equal(f.editor.document.pages[0], replacement);
   assert.equal(f.editor.recognitionBusy, false);
 });
+
+
+test('manual external OCR uses the external provider and background OCR remains local', async () => {
+  const f = fixture(); let externalCalls = 0;
+  f.editor.options.onRecognizeExternal = async () => { externalCalls++; return f.result; };
+  await f.editor.recognize(f.page.id, false, true);
+  assert.equal(externalCalls, 1); assert.equal(f.calls(), 0);
+  assert.equal(f.editor.document.pages[0].transcript, f.result.text);
+  await f.editor.recognize(f.page.id, true);
+  assert.equal(f.calls(), 0, 'local background OCR must preserve the external transcript for unchanged ink');
+  f.editor.document.pages[0].recognition = undefined;
+  const local = f.editor.recognize(f.page.id, true);
+  assert.equal(f.calls(), 1); assert.equal(externalCalls, 1);
+  f.finish(); await local;
+});

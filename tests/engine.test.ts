@@ -948,3 +948,21 @@ test('ordinary ink undo retains current text before undoing the earlier format',
     engine.redo(); engine.redo(); assert.equal(engine.getDocument().textBoxes![0].text, 'After drawing');
   }, page);
 });
+
+test('curved pressure strokes share live, replay and SVG interpolation', () => {
+  const page = createDocument(); page.paper = 'blank';
+  withEngine(({ engine, host, pointer, flush }) => {
+    pointer('pointerdown', 200, 300, { pressure: 0.2 });
+    pointer('pointermove', 210, 300, { pressure: 0.4 });
+    pointer('pointermove', 220, 304, { pressure: 0.7 });
+    pointer('pointerup', 230, 310, { pressure: 0.9 });
+    const samples = engine.getDocument().strokes[0].points;
+    assert.equal(samples.length, 4, 'render subdivisions do not inflate saved samples');
+    const liveArcs = host.canvases[1].context.arcs;
+    assert.ok(liveArcs > samples.length, 'curves are drawn with intermediate pressure samples');
+    assert.equal((engine.exportSvg().match(/<circle /g) ?? []).length, liveArcs);
+    const before = host.canvases[0].context.arcs;
+    engine.fit(); flush();
+    assert.equal(host.canvases[0].context.arcs - before, liveArcs, 'reopening/redrawing uses the same geometry');
+  }, page);
+});

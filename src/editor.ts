@@ -26,6 +26,7 @@ export interface EditorOptions {
   initialPageId?: string;
   onSearch?: () => void;
   onRecognize?: (page: InkPage) => Promise<RecognitionResult>;
+  onRecognizeExternal?: (page: InkPage) => Promise<RecognitionResult>;
 }
 const paths: Record<string, string> = {
   up: '<path d="m6 12 6-6 6 6M12 6v14"/>',
@@ -125,6 +126,7 @@ export class InkEditor {
   private searchInput!: HTMLInputElement;
   private recognitionStatus!: HTMLElement;
   private recognizeButton!: HTMLButtonElement;
+  private externalRecognizeButton?: HTMLButtonElement;
   private selectionActions!: HTMLElement;
   private lifecycle = 0;
   private disposed = false;
@@ -478,11 +480,17 @@ export class InkEditor {
     this.transcript = el('textarea', 'inkstone-textarea'); this.transcript.spellcheck = true; this.transcript.maxLength = MAX_TEXT_LENGTH;
     this.transcript.placeholder = 'Recognize handwriting or enter a transcript…'; this.transcript.setAttribute('aria-label', 'Handwriting transcript');
     this.transcript.addEventListener('input', () => this.updatePage({ transcript: this.transcript.value })); transcriptLabel.append(this.transcript);
-    this.recognizeButton = this.button('text', 'Recognize handwriting', () => { void this.recognize(); }, 'Recognize handwriting');
+    this.recognizeButton = this.button('text', 'Recognize locally', () => { void this.recognize(); }, 'Recognize locally');
     this.recognizeButton.disabled = !this.options.onRecognize;
+    if (this.options.onRecognizeExternal) {
+      this.externalRecognizeButton = this.button('sparkles', 'Recognize with external AI', () => { void this.recognize(this.activePageId, false, true); }, 'Recognize with external AI');
+    }
     this.recognitionStatus = el('p', 'inkstone-panel-hint'); this.recognitionStatus.setAttribute('role', 'status');
     this.recognitionStatus.textContent = this.options.onRecognize ? 'Recognition replaces the transcript. Review the result for accuracy.' : 'Handwriting recognition is available inside Obsidian when configured.';
-    this.notesPanel.append(typedLabel, transcriptLabel, this.recognizeButton, this.recognitionStatus,
+    this.notesPanel.append(typedLabel, transcriptLabel, this.recognizeButton);
+    if (this.externalRecognizeButton) this.notesPanel.append(this.externalRecognizeButton,
+      el('p', 'inkstone-panel-hint', 'External AI sends this page’s handwriting to the provider configured in Inkstone settings. Charges may apply. Background recognition stays local.'));
+    this.notesPanel.append(this.recognitionStatus,
       el('p', 'inkstone-panel-hint', 'Your system checks spelling in these text fields. After recognition, red wavy underlines on the page flag possible English spelling mistakes. Review the transcript if a handwritten word was misread.'));
   }
   private schedulePages(): void {
@@ -642,7 +650,7 @@ export class InkEditor {
     action('Undo',()=>this.undo()); action('Redo',()=>this.redo());
     action('Focus writing (Tab)',()=>this.root.classList.add('inkstone-focus-mode'));
     if(this.options.onMarkdown)action('Export notebook as Markdown',()=>{this.engine.flush();this.options.onMarkdown?.(this.document);});
-    if(this.options.onAI)action('Convert page to Markdown with AI…',()=>{this.engine.flush();void this.options.onAI?.(structuredClone(this.getActivePage()),appendTextToSvg(this.engine.exportSvg(),this.getActivePage().textBoxes));});
+    if(this.options.onAI)action('Convert page to Markdown or LaTeX with AI…',()=>{this.engine.flush();void this.options.onAI?.(structuredClone(this.getActivePage()),appendTextToSvg(this.engine.exportSvg(),this.getActivePage().textBoxes));});
     action('Add page before',()=>this.addPage(false,true));action('Add page after',()=>this.addPage());
     action('Paper templates',()=>this.showTemplates());
     action('Duplicate page',()=>this.addPage(true));
@@ -692,8 +700,9 @@ export class InkEditor {
       this.pendingOCR.delete(id); void this.recognize(id, true);
     }, this.options.settings?.recognitionDelayMs ?? 1800);
   }
-  private async recognize(pageId = this.activePageId, automatic = false): Promise<void> {
-    if (!this.options.onRecognize || this.recognitionBusy) return;
+  private async recognize(pageId = this.activePageId, automatic = false, external = false): Promise<void> {
+    const recognize = external && !automatic ? this.options.onRecognizeExternal : this.options.onRecognize;
+    if (!recognize || this.recognitionBusy) return;
     if (!automatic) this.engine.flush();
     const page = this.document.pages.find(page => page.id === pageId);
     if (!page || !page.strokes.length) { this.pendingOCR.delete(pageId); this.scheduleRecognition(); return; }
@@ -703,14 +712,15 @@ export class InkEditor {
     this.pendingOCR.delete(pageId);
     const lifecycle = this.lifecycle, strokes = page.strokes, transcript = page.transcript;
     this.recognitionBusy = true; this.recognizeButton.disabled = true;
-    this.recognitionStatus.textContent = 'Recognizing handwriting locally…';
+    if (this.externalRecognizeButton) this.externalRecognizeButton.disabled = true;
+    this.recognitionStatus.textContent = external ? 'Recognizing handwriting with external AI…' : 'Recognizing handwriting locally…';
     try {
-      const result = await this.options.onRecognize(page);
+      const result = await recognize(page);
       if (this.disposed || lifecycle !== this.lifecycle) return;
       const current = this.document.pages.find(page => page.id === pageId);
       if (!current || current.strokes !== strokes || current.transcript !== transcript) return;
       if (typeof result.text !== 'string' || result.text.length > MAX_TEXT_LENGTH) throw new Error('Recognition returned an invalid or oversized transcript.');
-      if (!result.text.trim()) { this.recognitionStatus.textContent = 'No text recognized. Try AI conversion for cursive handwriting or equations.'; return; }
+      if (!result.text.trim()) { this.recognitionStatus.textContent = 'No text recognized. Try external AI recognition for cursive handwriting or equations.'; return; }
       const updated = {...current, transcript:result.text, recognition:{transcript:result.text, words:result.words, inkSignature:result.inkSignature}};
       this.document = {...this.document, pages:this.document.pages.map(p => p.id === pageId ? updated : p)};
       this.emitChange(); this.schedulePages();
@@ -720,7 +730,7 @@ export class InkEditor {
       if (!this.disposed && lifecycle === this.lifecycle) this.recognitionStatus.textContent = error instanceof Error ? error.message : String(error);
     } finally {
       this.recognitionBusy = false;
-      if (!this.disposed) { this.recognizeButton.disabled = !this.options.onRecognize; this.scheduleRecognition(); }
+      if (!this.disposed) { this.recognizeButton.disabled = !this.options.onRecognize; if (this.externalRecognizeButton) this.externalRecognizeButton.disabled = false; this.scheduleRecognition(); }
     }
   }
   setSearchQuery(query: string): void {

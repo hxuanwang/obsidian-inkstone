@@ -2,13 +2,14 @@ import { DEFAULT_SETTINGS, parseSettings, type InkstoneSettings } from './settin
 import { InkstoneSettingsTab } from './settings-tab';
 import { notebookMarkdown } from './markdown';
 import { AIMarkdownModal } from './ai-modal';
-import { Notice, Plugin, TFile, TextFileView, WorkspaceLeaf, normalizePath } from "obsidian";
+import { Notice, Plugin, TFile, TFolder, TextFileView, WorkspaceLeaf, normalizePath, requestUrl } from "obsidian";
 import { InkEditor } from "./editor";
 import { createDocument, parseDocument, MAX_TEXT_LENGTH, type InkDocument } from "./model";
 
 import { NoteIndex, type SearchHit } from "./search";
 import { InkSearchModal } from "./search-modal";
 import { LocalRecognizer } from "./recognition";
+import { ExternalRecognizer } from "./external-recognition";
 
 export const INK_VIEW_TYPE = "inkstone-handwriting";
 const INK_EXTENSION = "inkstone";
@@ -18,7 +19,9 @@ class InkstoneView extends TextFileView {
   private editor: InkEditor | null = null;
   private document: InkDocument = createDocument();
   private source = "";
-  private dirty = false;
+  // Keep this separate from TextFileView’s internal dirty flag: the host resets
+  // its flag before calling getViewData() during save.
+  private needsSerialization = false;
   private generation = 0;
 
   constructor(leaf: WorkspaceLeaf, private plugin: InkstonePlugin) {
@@ -30,9 +33,9 @@ class InkstoneView extends TextFileView {
   getDisplayText(): string { return this.file?.basename ?? "Inkstone"; }
   getIcon(): string { return "pencil"; }
   getViewData(): string {
-    if (this.dirty) {
+    if (this.needsSerialization) {
       this.source = JSON.stringify(this.document);
-      this.dirty = false;
+      this.needsSerialization = false;
     }
     return this.source;
   }
@@ -41,7 +44,7 @@ class InkstoneView extends TextFileView {
     // Preserve the actual loaded source until a real edit occurs. In particular,
     // never autosave a replacement document over a malformed or newer file.
     this.source = data;
-    this.dirty = false;
+    this.needsSerialization = false;
     this.generation += 1;
     this.editor?.destroy();
     this.editor = null;
@@ -61,7 +64,7 @@ class InkstoneView extends TextFileView {
       settings: this.plugin.settings,
       onSettingsChange: patch => { void this.plugin.updateSettings(patch); },
       onMarkdown: doc => { if(file)void this.plugin.exportMarkdown(file,notebookMarkdown(doc,file.path)).catch(()=>undefined); },
-      onAI: async (_page, svg) => { if(file)new AIMarkdownModal(this.app,{...this.plugin.settings},svg,text=>this.plugin.exportMarkdown(file,text)).open(); },
+      onAI: async (_page, svg) => { if(file)new AIMarkdownModal(this.app,{...this.plugin.settings},svg,(text,format)=>this.plugin.exportConverted(file,text,format)).open(); },
       document: this.document,
       title: file?.basename ?? "Untitled",
       onChange: (document) => {
@@ -69,7 +72,7 @@ class InkstoneView extends TextFileView {
         this.document = document;
         // Serialize when TextFileView's queued save reads the data, keeping
         // whole-document JSON work out of the pen-up input callback.
-        this.dirty = true;
+        this.needsSerialization = true;
         this.requestSave();
         if (file) this.plugin.indexLiveDocument(file, document);
       },
@@ -80,6 +83,7 @@ class InkstoneView extends TextFileView {
       onNew: () => { void this.plugin.createNote(); },
       onSearch: () => this.plugin.searchNotes(),
       onRecognize: (page) => this.plugin.recognizer.recognize(page),
+      onRecognizeExternal: (page) => this.plugin.externalRecognizer.recognize(page),
     });
   }
 
@@ -98,7 +102,7 @@ class InkstoneView extends TextFileView {
     this.editor?.destroy();
     this.editor = null;
     this.source = "";
-    this.dirty = false;
+    this.needsSerialization = false;
     this.document = createDocument();
     this.contentEl.empty();
   }
@@ -129,6 +133,7 @@ export default class InkstonePlugin extends Plugin {
   }
   readonly index = new NoteIndex();
   recognizer!: LocalRecognizer;
+  externalRecognizer!: ExternalRecognizer;
   private indexRevisions = new Map<string, number>();
   private skipped = new Set<string>();
   private indexing = false;
@@ -245,7 +250,7 @@ export default class InkstonePlugin extends Plugin {
     } finally { this.recognitionBusy = false; progress.hide(); }
     if (!this.disposed) new Notice(`Recognized ${completed} pages. ${failed ? `${failed} notes could not be processed. ` : ''}Review transcripts for recognition errors.`);
   }
-  onunload(): void { this.disposed = true; for(const timer of this.indexTimers.values())clearTimeout(timer);this.indexTimers.clear(); void this.recognizer?.destroy(); }
+  onunload(): void { this.disposed = true; for(const timer of this.indexTimers.values())clearTimeout(timer);this.indexTimers.clear(); void this.recognizer?.destroy(); void this.externalRecognizer?.destroy(); }
 
   async onload(): Promise<void> {
     this.settings=parseSettings(await this.loadData());
@@ -253,6 +258,7 @@ export default class InkstonePlugin extends Plugin {
     for(const gesture of ['doubleTap','squeeze'] as const)this.addCommand({id:`pencil-${gesture}`,name:`Run Pencil ${gesture==='doubleTap'?'double-tap':'squeeze'} action`,checkCallback: checking => {const view=this.app.workspace.getActiveViewOfType(InkstoneView);if(!view)return false;if(!checking)view.pencilAction(gesture);return true;}});
     const pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
     this.recognizer = new LocalRecognizer(this.app.vault.adapter.getResourcePath(`${pluginDir}/assets/ocr`));
+    this.externalRecognizer = new ExternalRecognizer(() => this.settings, requestUrl);
     this.registerEvent(this.app.vault.on('create', file => { if (file instanceof TFile) this.queueIndex(file); }));
     this.registerEvent(this.app.vault.on('modify', file => { if (file instanceof TFile) this.queueIndex(file); }));
     this.registerEvent(this.app.vault.on('delete', file => { this.indexRevisions.set(file.path, (this.indexRevisions.get(file.path) ?? 0) + 1); this.index.remove(file.path); this.skipped.delete(file.path);clearTimeout(this.indexTimers.get(file.path));this.indexTimers.delete(file.path); }));
@@ -268,6 +274,10 @@ export default class InkstonePlugin extends Plugin {
       callback: () => { void this.createNote(); },
     });
     this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+      if (file instanceof TFolder) {
+        menu.addItem(item => item.setTitle("New writing").setIcon("pencil").onClick(() => this.createNote(file)));
+        return;
+      }
       if (!(file instanceof TFile) || file.extension !== INK_EXTENSION) return;
       menu.addItem((item) => item.setTitle("Open handwriting note").setIcon("pencil").onClick(async () => {
         await this.app.workspace.getLeaf(false).openFile(file);
@@ -285,9 +295,9 @@ export default class InkstonePlugin extends Plugin {
     return path;
   }
 
-  async createNote(): Promise<void> {
+  async createNote(targetFolder?: TFolder): Promise<void> {
     try {
-      const folder = this.app.fileManager.getNewFileParent(this.app.workspace.getActiveFile()?.path ?? "");
+      const folder = targetFolder ?? this.app.fileManager.getNewFileParent(this.app.workspace.getActiveFile()?.path ?? "");
       const path = this.availablePath(folder.path === "/" ? "" : folder.path, "Untitled handwriting", INK_EXTENSION);
       const file = await this.app.vault.create(path, JSON.stringify(createDocument(), null, 2));
       await this.app.workspace.getLeaf(false).openFile(file);
@@ -297,9 +307,16 @@ export default class InkstonePlugin extends Plugin {
   }
 
   async exportMarkdown(file: TFile, text: string): Promise<void> {
-    const folder=file.parent?.path==='/'?'':file.parent?.path??'';
-    try {const path=this.availablePath(folder,`${file.basename} Markdown`,'md');await this.app.vault.create(path,text);new Notice(`Exported ${path}`);}
-    catch(error){new Notice('Could not export Markdown.');throw error;}
+    return this.exportConverted(file, text, 'markdown');
+  }
+  async exportConverted(file: TFile, text: string, format: 'markdown' | 'latex'): Promise<void> {
+    const folder = file.parent?.path === '/' ? '' : file.parent?.path ?? '';
+    const label = format === 'latex' ? 'LaTeX' : 'Markdown';
+    try {
+      const path = this.availablePath(folder, `${file.basename} ${label}`, format === 'latex' ? 'tex' : 'md');
+      await this.app.vault.create(path, text);
+      new Notice(`Exported ${path}`);
+    } catch (error) { new Notice(`Could not export ${label}.`); throw error; }
   }
   async exportSvg(file: TFile, svg: string): Promise<void> {
     try {

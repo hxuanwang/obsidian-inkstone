@@ -1,4 +1,5 @@
 import { App, Modal, Notice, Setting, requestUrl } from 'obsidian';
+import type { ConversionFormat } from './markdown';
 import type { InkstoneSettings } from './settings';
 
 import { transcribeImage, validateEndpoint } from './ai-provider';
@@ -26,10 +27,10 @@ export async function svgImage(svg: string, signal?: AbortSignal): Promise<strin
 export class AIMarkdownModal extends Modal {
   private closed=false;
   private requestController?: AbortController;
-  constructor(app: App,private settings: InkstoneSettings,private svg: string,private save: (text:string)=>Promise<void>) {super(app);}
+  constructor(app: App,private settings: InkstoneSettings,private svg: string,private save: (text:string,format:ConversionFormat)=>Promise<void>) {super(app);}
   onOpen(): void {
     this.closed=false;
-    this.contentEl.createEl('h2',{text:'Convert page to Markdown'});
+    this.contentEl.createEl('h2',{text:'Convert page with AI'});
     let endpoint: string;
     try {endpoint=validateEndpoint(this.settings.aiEndpoint);if(!this.settings.aiModel.trim())throw new Error('Set a vision model in Inkstone settings.');}
     catch {this.contentEl.createEl('p',{text:'Configure a vision-capable Chat Completions endpoint and model in Inkstone settings first.'});return;}
@@ -38,24 +39,34 @@ export class AIMarkdownModal extends Modal {
     const status=this.contentEl.createEl('p');status.setAttribute('role','status');
     const draft=this.contentEl.createEl('textarea',{cls:'inkstone-ai-draft'});draft.setAttribute('aria-label','Markdown draft');draft.spellcheck=this.settings.spellcheck;draft.hidden=true;
     let busy=false;
+    let format:ConversionFormat='markdown';
+    let draftFormat:ConversionFormat='markdown';
+    let formatControl:import('obsidian').DropdownComponent;
+    new Setting(this.contentEl).setName('Output format').addDropdown(control=>{
+      formatControl=control;control.addOptions({markdown:'Markdown (Obsidian math)',latex:'LaTeX document (.tex)'}).setValue(format).onChange(value=>{
+        format=value==='latex'?'latex':'markdown';
+        draft.hidden=true;draft.value='';saveButton.setDisabled(true);status.textContent='';
+        saveButton.setButtonText(format==='latex'?'Save LaTeX document':'Save Markdown note');
+      });
+    });
     new Setting(this.contentEl).addButton(button=>button.setButtonText('Convert page').setCta().onClick(async()=>{
-      if(busy)return;busy=true;button.setDisabled(true);status.textContent='Converting page…';
+      if(busy||this.closed)return;busy=true;button.setDisabled(true);formatControl.setDisabled(true);saveButton.setDisabled(true);status.textContent='Converting page…';
       const controller=new AbortController();this.requestController=controller;
       const current=()=>!this.closed&&this.requestController===controller;
       try {
         let image:string;
         try {image=await svgImage(this.svg,controller.signal);} catch {throw new Error('Could not render this page for conversion.');}
         if(!current())return;
-        const text=await transcribeImage(config,image,this.settings.aiPrompt,requestUrl,controller.signal);
+        const text=await transcribeImage(config,image,this.settings.aiPrompt,requestUrl,controller.signal,format);
         if(!current())return;
-        draft.value=text;draft.hidden=false;saveButton.setDisabled(false);status.textContent='Draft ready. Check the Markdown and LaTeX, then save a new note.';draft.focus();
+        draftFormat=format;draft.setAttribute('aria-label',format==='latex'?'LaTeX draft':'Markdown draft');draft.value=text;draft.hidden=false;saveButton.setDisabled(false);status.textContent=format==='latex'?'Draft ready. Review the LaTeX source, then save a new .tex document.':'Draft ready. Check the Markdown and equations, then save a new note.';draft.focus();
       } catch(error) {if(current())status.textContent=error instanceof Error?error.message:'Conversion failed.';}
-      finally {if(current()){this.requestController=undefined;busy=false;button.setDisabled(false);}}
+      finally {if(current()){this.requestController=undefined;busy=false;button.setDisabled(false);formatControl.setDisabled(false);}}
     }));
     let saveButton: import('obsidian').ButtonComponent;
     new Setting(this.contentEl).addButton(button=>{saveButton=button;button.setButtonText('Save Markdown note').setDisabled(true).onClick(async()=>{
-      if(!draft.value.trim()||busy)return;busy=true;button.setDisabled(true);
-      try {await this.save(draft.value);this.close();}catch {new Notice('Could not save Markdown. Your draft is still available.');button.setDisabled(false);}finally{busy=false;}
+      if(!draft.value.trim()||busy||this.closed)return;busy=true;button.setDisabled(true);
+      try {await this.save(draft.value,draftFormat);this.close();}catch {new Notice('Could not save the document. Your draft is still available.');button.setDisabled(false);}finally{busy=false;}
     });});
   }
   onClose(): void {this.closed=true;this.requestController?.abort();this.requestController=undefined;this.contentEl.empty();}

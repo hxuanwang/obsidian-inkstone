@@ -24,7 +24,8 @@ export class InkstoneSettingsTab extends PluginSettingTab {
     this.containerEl.createEl('p',{text:'Obsidian’s web plugin API does not expose native Apple Pencil squeeze, double-tap, or the iPad system Pencil preference. These action mappings can be invoked through Inkstone commands and a future native host bridge. Hardware gestures require host support.'});
     const actions={eraser:'Switch current tool / eraser',previous:'Switch current / previous tool',palette:'Show tool palette',undo:'Undo',none:'Do nothing'};
     dropdown('Double-tap action','doubleTap',actions);dropdown('Squeeze action','squeeze',actions);
-    this.containerEl.createEl('h3',{text:'AI Markdown and math'});
+    this.containerEl.createEl('h3',{text:'External OCR and AI conversion'});
+    this.containerEl.createEl('p',{text:'Use Recognize with external AI in the text panel for cursive, multilingual handwriting, and formulas. It sends cropped pen ink to this provider only when requested. Background OCR stays local. AI page conversion offers Markdown or a standalone LaTeX document.'});
     this.containerEl.createEl('p',{text:'Optional. Use a vision-capable provider with the Chat Completions image format. Only pages you explicitly submit are sent. API keys are stored in this plugin’s data.json; vault sync may copy that file.'});
     let configurationVersion=0;
     let modelInput: import('obsidian').TextComponent;

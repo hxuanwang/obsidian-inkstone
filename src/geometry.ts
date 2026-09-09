@@ -136,3 +136,42 @@ export function createShape(mode: Exclude<ShapeMode, 'auto'>, start: Point, end:
   } else vertices = [start, end];
   return vertices.map((p, i) => ({ ...p, pressure: start.pressure, time: start.time + (end.time - start.time) * i / Math.max(1, vertices.length - 1) }));
 }
+
+/** Causal, bounded interpolation: only the last three samples are needed, so
+ * new ink never replays the stroke. Stored samples remain untouched. Sharp
+ * corners (including constructed shapes) retain their exact straight edges. */
+export function smoothInkSegment(point: Point, previous?: Point, before?: Point): Point[] {
+  if (!previous || !before) return [point];
+  const dx = point.x - previous.x, dy = point.y - previous.y;
+  const bx = previous.x - before.x, by = previous.y - before.y;
+  const length = Math.hypot(dx, dy), priorLength = Math.hypot(bx, by);
+  if (length < 0.1 || priorLength < 0.1) return [point];
+  const dot = (dx * bx + dy * by) / (length * priorLength);
+  if (dot < 0.75 || dot > 0.9999) return [point];
+  // The start tangent follows the preceding motion; cap sideways deviation
+  // so sparse events cannot make loops or move fine handwriting appreciably.
+  const bend = Math.max(-1, Math.min(1, (bx * dy - by * dx) / priorLength / 3));
+  const nx = -dy / length, ny = dx / length;
+  const steps = Math.min(24, Math.max(3, Math.ceil(length / 1.5)));
+  return Array.from({ length: steps }, (_, i) => {
+    const t = (i + 1) / steps, offset = -3 * (1 - t) ** 2 * t * bend;
+    return { x: previous.x + dx * t + nx * offset, y: previous.y + dy * t + ny * offset,
+      pressure: previous.pressure + (point.pressure - previous.pressure) * t,
+      time: previous.time + (point.time - previous.time) * t };
+  });
+}
+
+/** External tangents between pressure discs avoid the scalloped shoulders
+ * produced by perpendicular trapezoids when adjacent radii differ. */
+export function inkSegmentOutline(a: XY, ar: number, b: XY, br: number): XY[] {
+  const dx = b.x - a.x, dy = b.y - a.y, length = Math.hypot(dx, dy);
+  if (length <= Math.abs(ar - br) || length < 0.001) return [];
+  const ux = dx / length, uy = dy / length, along = (ar - br) / length;
+  const across = Math.sqrt(Math.max(0, 1 - along * along));
+  const plus = { x: ux * along - uy * across, y: uy * along + ux * across };
+  const minus = { x: ux * along + uy * across, y: uy * along - ux * across };
+  return [{ x: a.x + plus.x * ar, y: a.y + plus.y * ar },
+    { x: b.x + plus.x * br, y: b.y + plus.y * br },
+    { x: b.x + minus.x * br, y: b.y + minus.y * br },
+    { x: a.x + minus.x * ar, y: a.y + minus.y * ar }];
+}

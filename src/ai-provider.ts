@@ -1,4 +1,4 @@
-import { readVisionResponse, visionRequest } from './markdown';
+import { readVisionResponse, visionRequest, type ConversionFormat } from './markdown';
 
 /** Provider operations shared by settings and page conversion. Never return raw network errors. */
 export function validateEndpoint(raw: string): string {
@@ -63,9 +63,9 @@ export async function testProvider(config:ProviderConfig,transport:ProviderTrans
   const result=await providerRequest({url,method:'POST',headers:headers(config),body,throw:false},transport,signal);
   try {readVisionResponse(result);} catch {throw new Error('The provider responded, but did not return compatible text for the image test. Check the vision model.');}
 }
-export async function transcribeImage(config:ProviderConfig,image:string,instructions:string,transport:ProviderTransport,signal?:AbortSignal):Promise<string> {
+export async function transcribeImage(config:ProviderConfig,image:string,instructions:string,transport:ProviderTransport,signal?:AbortSignal,format:ConversionFormat='markdown'):Promise<string> {
   const url=validateEndpoint(config.aiEndpoint);
   if(!config.aiModel.trim())throw new Error('Choose or enter a vision model first.');
-  const body=JSON.stringify(visionRequest(config.aiModel.trim(),image,instructions));
-  return readVisionResponse(await providerRequest({url,method:'POST',headers:headers(config),body,throw:false},transport,signal,120_000));
+  const body=JSON.stringify(visionRequest(config.aiModel.trim(),image,instructions,format));
+  return readVisionResponse(await providerRequest({url,method:'POST',headers:headers(config),body,throw:false},transport,signal,120_000),format);
 }

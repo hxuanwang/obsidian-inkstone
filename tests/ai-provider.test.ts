@@ -238,3 +238,19 @@ test('closing conversion during rasterization prevents a later provider request'
   const pending=convert.click();modal.onClose();await pending;
   assert.equal(state.requests.length,0);assert.equal(state.image.onload,null);assert.equal(state.revoked,true);
 });
+
+test('conversion format controls provider prompt and saved extension choice without uploading on selection',async()=>{
+  const {state,plugin,exports}=await fixture();
+  let saved:any;
+  const modal=new exports.AIMarkdownModal({},plugin.settings,'<svg/>',async(text:string,format:string)=>{saved={text,format};});modal.onOpen();
+  const controls=()=>state.rows.flatMap((row:any)=>row.controls);
+  const format=state.rows.findLast((row:any)=>row.name==='Output format').controls[0];
+  await format.change('latex');assert.equal(state.requests.length,0);
+  state.transport=async(request:ProviderRequest)=>{
+    assert.match(JSON.parse(request.body!).messages[0].content[0].text,/standalone LaTeX/);
+    return {status:200,json:{choices:[{message:{content:'```latex\n\\documentclass{article}\n\\begin{document}x\\end{document}\n```'}}]}};
+  };
+  await controls().find((control:any)=>control.label==='Convert page').click();
+  await controls().find((control:any)=>control.label==='Save LaTeX document').click();
+  assert.equal(saved.format,'latex');assert.match(saved.text,/^\\documentclass/);
+});

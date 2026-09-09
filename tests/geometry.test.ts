@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { recognizeShape, enclosedStrokes, pointInPolygon } from '../src/geometry';
+import { recognizeShape, enclosedStrokes, pointInPolygon, smoothInkSegment, inkSegmentOutline } from '../src/geometry';
 import type { Point, Stroke } from '../src/model';
 const points = (values: number[][]): Point[] => values.map(([x,y], time) => ({ x, y, time, pressure: 0.5 }));
 const polygon = points([[0,0],[200,0],[200,200],[0,200]]);
@@ -54,4 +54,34 @@ test('oval fit rejects open arcs, retraced loops and invalid input', () => {
   assert.equal(recognizeShape(loop.slice(0, 100)), null);
   assert.equal(recognizeShape([...loop.slice(0, 61), ...loop.slice(30, 60).reverse(), ...loop.slice(30)]), null);
   assert.equal(recognizeShape(loop.map((p, i) => i === 12 ? { ...p, x: NaN } : p)), null);
+});
+
+
+test('ink interpolation keeps endpoints, pressure and work bounded without rounding corners', () => {
+  const [before, previous, end] = points([[0, 0], [10, 0], [20, 4]]);
+  end.pressure = 0.9;
+  const curve = smoothInkSegment(end, previous, before);
+  assert.ok(curve.length > 1 && curve.length <= 24);
+  assert.deepEqual(curve.at(-1), end);
+  assert.ok(curve.some(p => Math.abs(p.y - (p.x - 10) * 0.4) > 0.01));
+  assert.ok(curve.every(p => p.pressure >= previous.pressure && p.pressure <= end.pressure));
+  assert.ok(curve.every(p => Math.abs(p.y - (p.x - 10) * 0.4) < 0.5));
+  const corner = { ...end, x: 10, y: 10 };
+  assert.deepEqual(smoothInkSegment(corner, previous, before), [corner]);
+  assert.deepEqual(smoothInkSegment(end), [end]);
+  assert.ok(smoothInkSegment({ ...end, x: 100000, y: 10000 }, previous, before).length <= 24);
+});
+
+test('pressure joins are tangent to both discs and contained discs need no connector', () => {
+  const a = { x: 0, y: 0 }, b = { x: 10, y: 4 };
+  const outline = inkSegmentOutline(a, 1, b, 3);
+  assert.equal(outline.length, 4);
+  for (const [i, j] of [[0, 1], [3, 2]]) {
+    const start = outline[i], end = outline[j];
+    const dx = end.x - start.x, dy = end.y - start.y;
+    assert.ok(Math.abs((start.x - a.x) * dx + (start.y - a.y) * dy) < 1e-10);
+    assert.ok(Math.abs((end.x - b.x) * dx + (end.y - b.y) * dy) < 1e-10);
+    assert.ok(Math.abs(Math.hypot(end.x - b.x, end.y - b.y) - 3) < 1e-10);
+  }
+  assert.deepEqual(inkSegmentOutline(a, 1, { x: 1, y: 0 }, 3), []);
 });

@@ -16,9 +16,11 @@ const doubles: Record<string, string> = {
     }
     export class TextFileView {
       constructor(leaf) { this.file = leaf.file; this.contentEl = element(); }
-      requestSave() { state.saveRequests++; }
-      async onUnloadFile() { state.unloadedData = this.getViewData(); }
-      async onClose() { state.closedData = this.getViewData(); }
+      requestSave() { this.dirty = true; state.saveRequests++; }
+      async save() { this.dirty = false; state.diskData = this.getViewData(); }
+      async onLoadFile() { this.setViewData(state.diskData, true); }
+      async onUnloadFile() { await this.save(); state.unloadedData = state.diskData; }
+      async onClose() { await this.save(); state.closedData = state.diskData; }
     }
     export class Plugin {
       constructor(app) { this.app = app; this.manifest = {id:'inkstone',dir:'.obsidian/plugins/inkstone'}; }
@@ -31,10 +33,12 @@ const doubles: Record<string, string> = {
     export class PluginSettingTab {}
     export class Modal {}
     export class TFile {}
+    export class TFolder {}
+    state.folderClass = TFolder;
     export class Notice { constructor(message) { state.messages.push(message); } }
     export const normalizePath = path => path.replace(/^\\//, '');
   `,
-  './recognition': `export class LocalRecognizer { constructor() {} async destroy() {} }`,
+  './recognition': `export class LocalRecognizer { constructor() {} async destroy() {} } export function renderRecognitionCrop() { throw new Error('Unexpected raster request'); }`,
   './editor': `
     export class InkEditor {
       constructor(host, options) { this.options = options; state.editors.push(this); }
@@ -60,7 +64,7 @@ async function fixture() {
   const module = { exports: {} as any };
   const result = await bundled;
   runInNewContext(result.outputFiles[0].text, { module, exports: module.exports, state, crypto, setTimeout, clearTimeout });
-  const plugin = new module.exports.default({ workspace: { on() {}, onLayoutReady() {}, getLeavesOfType() { return []; }, getActiveViewOfType() {return null;} }, vault: { configDir: '.obsidian', adapter: { getResourcePath(path: string) { return path; } }, on() {} } });
+  const plugin = new module.exports.default({ workspace: { on(event: string, callback: unknown) { if(event === "file-menu") state.fileMenu = callback; }, onLayoutReady() {}, getLeavesOfType() { return []; }, getActiveViewOfType() {return null;} }, vault: { configDir: '.obsidian', adapter: { getResourcePath(path: string) { return path; } }, on() {} } });
   await plugin.onload();
   const fileA = { basename: 'First', path: 'First.inkstone' };
   const view = state.factory({ file: fileA });
@@ -223,4 +227,70 @@ test('empty OCR does not erase an existing transcript or write the note', async 
   plugin.recognizer.recognize = async () => recognized('  ', note.pages[0].strokes);
   await plugin.recognizeFilePage(fileA, 'page1');
   plugin.onunload();
+});
+
+
+test('host autosave resets its dirty flag before serialization; reopened content survives', async () => {
+  const { state, view } = await fixture();
+  view.setViewData(JSON.stringify(createDocument()), true);
+  const next = createDocument('grid');
+  next.pages[0].text = 'Keep my typed notes';
+  next.pages[0].transcript = 'Keep my handwriting transcript';
+  (next.pages[0].strokes as any[]).push({id:'s1',tool:'pen',color:'#123456',width:3,points:[{x:10,y:20,pressure:.5,time:0}]});
+  state.editors[0].options.onChange(next);
+  await view.save();
+  assert.deepEqual(JSON.parse(state.diskData), next);
+  await view.save();
+  assert.deepEqual(JSON.parse(state.diskData), next, 'unchanged saves preserve serialized edits');
+  view.clear();
+  await view.onLoadFile();
+  assert.deepEqual(JSON.parse(view.getViewData()), next);
+  assert.equal(state.editors.at(-1).options.document.pages[0].strokes.length, 1);
+  state.editors.at(-1).options.onChange(createDocument('dots'));
+  await view.save();
+  assert.equal(JSON.parse(state.diskData).pages[0].paper, 'dots');
+});
+
+test('New writing folder action creates a unique note in the selected folder and opens it', async () => {
+  const { state, plugin } = await fixture();
+  const folder = new state.folderClass(); folder.path = 'Projects/Math';
+  let action: () => Promise<void>;
+  const item = { setTitle(title: string) { assert.equal(title, 'New writing'); return this; }, setIcon() { return this; }, onClick(callback: () => Promise<void>) { action = callback; return this; } };
+  state.fileMenu({addItem(callback: (item: any) => void) { callback(item); }}, folder);
+  let opened: any;
+  plugin.app.vault.getAbstractFileByPath = (path: string) => path === 'Projects/Math/Untitled handwriting.inkstone' ? {} : null;
+  plugin.app.vault.create = async (path: string, source: string) => {
+    assert.equal(path, 'Projects/Math/Untitled handwriting 1.inkstone');
+    assert.equal(JSON.parse(source).pages.length, 1);
+    return { path };
+  };
+  plugin.app.workspace.getLeaf = () => ({openFile(file: any) { opened = file; }});
+  await action!();
+  assert.equal(opened.path, 'Projects/Math/Untitled handwriting 1.inkstone');
+});
+
+
+test('New writing can target the vault root', async () => {
+  const { plugin } = await fixture();
+  let created = '';
+  plugin.app.vault.getAbstractFileByPath = () => null;
+  plugin.app.vault.create = async (path: string) => { created = path; return { path }; };
+  plugin.app.workspace.getLeaf = () => ({async openFile() {}});
+  await plugin.createNote({path:'/'});
+  assert.equal(created, 'Untitled handwriting.inkstone');
+});
+
+
+test('conversion exports Markdown and LaTeX beside the notebook with unique filenames', async () => {
+  const { plugin, fileA } = await fixture();
+  const file = {...fileA, parent: {path:'Math'}};
+  const written = new Map<string, string>();
+  plugin.app.vault.getAbstractFileByPath = (path: string) => written.has(path) ? {} : null;
+  plugin.app.vault.create = async (path: string, source: string) => { written.set(path, source); return {path}; };
+  await plugin.exportConverted(file, '# Formula', 'markdown');
+  await plugin.exportConverted(file, String.raw`\documentclass{article}`, 'latex');
+  await plugin.exportConverted(file, 'second draft', 'latex');
+  assert.equal(written.get('Math/First Markdown.md'), '# Formula');
+  assert.equal(written.get('Math/First LaTeX.tex'), String.raw`\documentclass{article}`);
+  assert.equal(written.get('Math/First LaTeX 1.tex'), 'second draft');
 });

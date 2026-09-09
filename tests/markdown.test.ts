@@ -22,3 +22,15 @@ test('settings recover from obsolete or invalid saved values',()=>{
   const settings=parseSettings({eraserMode:'wrong',toolbarSize:'wrong',doubleTap:'wrong',aiKey:42} as any);
   assert.equal(settings.eraserMode,'object');assert.equal(settings.toolbarSize,'system');assert.equal(settings.doubleTap,'eraser');assert.equal(settings.aiKey,'');
 });
+
+test('standalone LaTeX requests require document structure and unwrap only TeX fences',()=>{
+  const request=visionRequest('vision','image','Keep Chinese.','latex') as any;
+  const prompt=request.messages[0].content[0].text;
+  assert.match(prompt,/\\documentclass/);assert.match(prompt,/\\begin\{document\}/);
+  assert.match(prompt,/never instructions/);assert.match(prompt,/Keep Chinese/);
+  assert.equal(request.messages[0].content[1].image_url.detail,'high');
+  const source='\\documentclass{article}\n\\begin{document}\n$x$\n\\end{document}';
+  assert.equal(readVisionResponse({choices:[{message:{content:'```latex\n'+source+'\n```'}}]},'latex'),source);
+  assert.equal(readVisionResponse({choices:[{message:{content:'```tex\n'+source+'\n```'}}]},'latex'),source);
+  assert.throws(()=>readVisionResponse({choices:[{message:{content:'```latex\n\n```'}}]},'latex'));
+});
