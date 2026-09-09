@@ -6,8 +6,9 @@ const stroke: Stroke={id:'s',tool:'pen',color:'#123456',width:2,points:[{x:0,y:5
 test('pixel eraser cuts a sparse crossing into independent pressure-preserving fragments',()=>{
   const fragments=eraseStroke(stroke,{x:50,y:0},{x:50,y:100},5,'pixel');
   assert.equal(fragments.length,2);
-  assert.ok(Math.abs(fragments[0].points.at(-1)!.x-44.125)<.001);
-  assert.ok(Math.abs(fragments[1].points[0].x-55.875)<.001);
+  // Half-pressure ink has radius .59; the swept eraser adds another 5.
+  assert.ok(Math.abs(fragments[0].points.at(-1)!.x-44.41)<.001);
+  assert.ok(Math.abs(fragments[1].points[0].x-55.59)<.001);
   assert.equal(fragments[0].points[0].x,0);assert.equal(fragments[1].points.at(-1)!.x,100);
   assert.notEqual(fragments[0].id,fragments[1].id);
   for(const fragment of fragments)for(const p of fragment.points){assert.equal(p.pressure,.5);assert.equal(p.x,p.time);}

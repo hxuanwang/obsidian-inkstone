@@ -247,6 +247,32 @@ test('WebKit coalesced batches retain dispatched endpoints without duplicating s
   });
 });
 
+test('dense Pencil input closes stabilization lag on repeated and coalesced release endpoints', () => {
+  for (const coalesced of [false, true]) withEngine(({ engine, pointer, event }) => {
+    pointer('pointerdown', 300, 300, { pressure: 0 });
+    pointer('pointermove', 301, 301, { pressure: .8 });
+    pointer('pointerup', 301, 301, { pressure: .8,
+      ...(coalesced ? { getCoalescedEvents: () => [event(301, 301, { pressure: .8, timeStamp: 3 })], timeStamp: 3 } : {}) });
+    const points = engine.getDocument().strokes[0].points;
+    assert.equal(points[0].pressure, 0, 'lightest contact is not replaced by fallback pressure');
+    assert.ok(points[1].x > 300 && points[1].x < 301, 'dense movement is stabilized');
+    assert.ok(Math.abs(points.at(-1)!.x - 301) < 1e-6);
+    assert.ok(Math.abs(points.at(-1)!.y - 301) < 1e-6);
+  });
+});
+
+test('stationary Pencil force changes are retained and release reaches zero pressure', () => {
+  withEngine(({ engine, pointer }) => {
+    pointer('pointerdown', 300, 300, { pressure: .1 });
+    pointer('pointermove', 300, 300, { pressure: 1 });
+    pointer('pointerup', 300, 300, { pressure: 0 });
+    const points = engine.getDocument().strokes[0].points;
+    assert.equal(points.length, 3);
+    assert.ok(points[1].pressure > .5);
+    assert.equal(points[2].pressure, 0);
+  });
+});
+
 test('eraser catches a crossing between sparse events and undo/redo restores the transaction', () => {
   withEngine(({ engine, pointer, changes, flush }) => {
     pointer('pointerdown', 200, 300);

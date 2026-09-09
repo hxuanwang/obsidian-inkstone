@@ -1,7 +1,7 @@
 import { type InkPage as InkDocument, type PageFormat, type Paper, type PageImage, type Point, type Stroke, isImageSource, MAX_PAGE_IMAGES, pageDimensions, formatPage } from './model';
 import { eraseStroke, type EraserMode } from './eraser';
 import { createShape, type ShapeMode, pointInPolygon, enclosedStrokes, recognizeShape, smoothInkSegment, inkSegmentOutline } from './geometry';
-import { penRadius, penSegment, penTail, type PenSegment } from './pen-rendering';
+import { penRadius, penSegment, penTail, stabilizePenPoint, type PenSegment } from './pen-rendering';
 import { drawPaper, paperSvg } from './paper';
 export { PAGE_HEIGHT, PAGE_WIDTH } from './model';
 
@@ -69,7 +69,7 @@ export class InkEngine {
   private size: XY = { x: 1, y: 1 };
   private dpr = 1;
   private fitMode: 'width' | 'page' | 'manual' = 'width';
-  private active: { pointerId: number; stroke: Stroke } | null = null;
+  private active: { pointerId: number; stroke: Stroke; lastInput: Point } | null = null;
   private erase: { pointerId: number; before: InkDocument; last: XY } | null = null;
   private touches = new Map<number, XY>();
   private pan: { pointerId: number; pointerType: string; last: XY } | null = null;
@@ -764,7 +764,7 @@ export class InkEngine {
   };
   private sample(event: PointerEvent, rect?: DOMRect): Point {
     const point = this.toPage(rect ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : this.local(event));
-    return { ...point, pressure: event.pointerType === 'pen' ? clamp(event.pressure || 0.35, 0.05, 1) : 0.5, time: event.timeStamp };
+    return { ...point, pressure: event.pointerType === 'pen' ? clamp(Number.isFinite(event.pressure) ? event.pressure : 0.5, 0, 1) : 0.5, time: event.timeStamp };
   }
 
   private pointerDown = (event: PointerEvent): void => {
@@ -821,7 +821,7 @@ export class InkEngine {
     const tool = this.tool === 'highlighter'  ? 'highlighter' : 'pen';
     const stroke: Stroke = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`, tool, color: this.color, width: this.width, points: [point], ...(this.tool === 'shape' ? { smoothing: 'none' as const } : {}) };
     this.shapeStart = this.tool === 'shape' && this.shapeMode !== 'auto' ? point : null;
-    this.active = { pointerId: event.pointerId, stroke };
+    this.active = { pointerId: event.pointerId, stroke, lastInput: point };
     this.live.style.opacity = tool === 'highlighter' ? '0.28' : '1';
     this.clear(this.liveContext); this.clear(this.tipContext);
     this.clipped(this.liveContext, () => this.drawSegment(this.liveContext, stroke, point));
@@ -869,10 +869,15 @@ export class InkEngine {
       this.clipped(this.liveContext, () => {
         for (const sample of samples) {
           const previous = stroke.points[stroke.points.length - 1];
-          const point = this.sample(sample, rect);
-          if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || point.time < previous.time || distance(previous, point) < 0.1) continue;
-          // Stabilize pressure without delaying the spatial Pencil samples.
-          point.pressure = previous.pressure * 0.35 + point.pressure * 0.65;
+          let point = this.sample(sample, rect);
+          const raw = this.active!.lastInput;
+          const final = event.type === 'pointerup' && sample === event;
+          // A repeated release position must still close the stabilizer's lag.
+          const closeTip = final && distance(previous, point) > 1e-6;
+          if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || point.time < raw.time ||
+            (!closeTip && distance(raw, point) < 0.1 && Math.abs(raw.pressure - point.pressure) < 0.002)) continue;
+          this.active!.lastInput = point;
+          if (this.tool === 'pen' && sample.pointerType === 'pen') point = stabilizePenPoint(previous, point, this.zoom, final);
           stroke.points.push(point); this.drawSample(this.liveContext, stroke, stroke.points.length - 1);
         }
       });

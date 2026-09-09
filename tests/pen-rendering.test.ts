@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { penRadius, penSegment, penTail } from '../src/pen-rendering';
+import { penRadius, penSegment, penTail, stabilizePenPoint } from '../src/pen-rendering';
 import type { Point } from '../src/model';
 
 const trace: Point[] = [
@@ -42,14 +42,14 @@ test('tip reaches the actual Pencil position and committed segments never change
   assert.equal(penSegment(trace, 4), null);
 });
 
-test('pressure produces subtle width variation without discontinuities', () => {
-  assert.ok(penRadius(3, 0.75) / penRadius(3, 0.2) > 1.1);
-  assert.ok(penRadius(3, 1) / penRadius(3, 0) <= 4 / 3);
+test('Pencil pressure produces fine light strokes and firm downstrokes without discontinuities', () => {
+  assert.ok(penRadius(3, 0.75) / penRadius(3, 0.2) > 2);
+  assert.ok(penRadius(3, 1) / penRadius(3, 0) > 5);
   assert.equal(penRadius(3, 1), 1.5);
   let previous = penRadius(3, 0);
   for (let i = 1; i <= 100; i++) {
     const radius = penRadius(3, i / 100);
-    assert.ok(radius >= previous && radius - previous < 0.018);
+    assert.ok(radius >= previous && radius - previous < 0.013);
     previous = radius;
   }
   assert.equal(penRadius(3, -1), penRadius(3, 0));
@@ -66,4 +66,21 @@ test('very sparse and stationary samples keep bounded finite rendering work', ()
       assert.ok(segment.points.every(p => p.pressure >= 0.1 && p.pressure <= 0.9));
     }
   }
+});
+
+test('dense Pencil jitter is reduced with bounded lag and exact lift position', () => {
+  let previous = { x: 0, y: 0, pressure: .5, time: 0 };
+  let error = 0;
+  for (let i = 1; i <= 100; i++) {
+    const raw = { x: i, y: i % 2 ? .8 : -.8, pressure: .5, time: i * 8 };
+    const filtered = stabilizePenPoint(previous, raw, 1);
+    assert.ok(Math.hypot(raw.x - filtered.x, raw.y - filtered.y) < 2.2);
+    if (i > 10) error += filtered.y ** 2;
+    previous = filtered;
+  }
+  assert.ok(error / 90 < .15, 'alternating spatial noise is attenuated');
+  const lift = { x: 101, y: 0, pressure: 0, time: 810 };
+  assert.deepEqual(stabilizePenPoint(previous, lift, 1, true), lift);
+  const sparse = { ...lift, x: 150 };
+  assert.equal(stabilizePenPoint(previous, sparse, 1).x, 150);
 });
