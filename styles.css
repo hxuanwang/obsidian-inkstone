@@ -337,3 +337,27 @@
 .inkstone-page-popover>strong{padding:4px 6px}
 .inkstone-spelling-layer{position:absolute;left:0;top:0;transform-origin:0 0;pointer-events:none;overflow:hidden;z-index:3}
 .inkstone-ink-spelling-mark{position:absolute;height:6px;pointer-events:none;background:repeat-x left top/12px 6px url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='6'%3E%3Cpath d='M0 3Q3 0 6 3T12 3' fill='none' stroke='%23dc3545' stroke-width='1.5'/%3E%3C/svg%3E")}
+
+/* Images stays anchored to its tool, while the OS owns Photos and camera access. */
+.inkstone-editor{position:relative}
+.inkstone-image-picker{position:absolute;z-index:30;width:360px;max-width:calc(100% - 16px);max-height:calc(100% - 16px);overflow:auto;padding:12px;border:1px solid var(--ink-line);border-radius:24px;background:var(--ink-panel);color:var(--ink-text);box-shadow:0 10px 36px #0003}
+.inkstone-image-picker-heading{display:flex;align-items:center;gap:4px;margin-bottom:12px}
+.inkstone-image-picker-heading strong{flex:1;padding-left:12px;font-size:17px;font-weight:650}
+.inkstone-editor .inkstone-image-photos,.inkstone-editor .inkstone-image-files{display:flex;width:100%;min-height:44px;background:var(--ink-bg);border:1px solid var(--ink-line);border-radius:14px}
+.inkstone-image-recent-label{font-size:12px;font-weight:600;color:var(--ink-muted);margin:14px 4px 8px}
+.inkstone-image-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px}
+.inkstone-editor .inkstone-image-tile{appearance:none;display:block;aspect-ratio:1;min-height:44px;padding:0;margin:0;overflow:hidden;border:1px solid var(--ink-line);border-radius:16px;background:var(--ink-bg);cursor:pointer;box-shadow:none}
+.inkstone-image-tile img{display:block;width:100%;height:100%;object-fit:cover}
+.inkstone-image-empty{padding:24px 14px;text-align:center;color:var(--ink-muted);line-height:1.5}
+.inkstone-image-picker button:focus-visible{outline:2px solid var(--ink-accent);outline-offset:2px}
+
+.inkstone-selection-actions{bottom:auto;flex-wrap:nowrap;border-radius:22px;align-items:center;gap:2px}
+.inkstone-selection-popover{position:relative}
+.inkstone-selection-popover>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:center;min-height:36px;padding:0 10px}
+.inkstone-selection-popover>summary::-webkit-details-marker{display:none}
+.inkstone-selection-popover-panel{position:absolute;top:calc(100% + 8px);right:0;min-width:180px;max-width:calc(100vw - 48px);background:var(--ink-panel);border:1px solid var(--ink-line);border-radius:16px;padding:8px;box-shadow:0 8px 28px #263b3230;z-index:8;max-height:240px;overflow:auto}
+.inkstone-selection-popover-panel>.inkstone-button{display:flex;width:100%;justify-content:flex-start}
+.inkstone-selection-swatches{display:grid;grid-template-columns:repeat(5,1fr)}
+
+.inkstone-paste-selection{display:none!important}
+[data-tool="lasso"] .inkstone-paste-selection{display:flex!important}

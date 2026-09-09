@@ -113,7 +113,7 @@ const bundled=build({entryPoints:['src/settings-tab.ts','src/ai-modal.ts'],bundl
     builder.onLoad({filter:/.*/,namespace:'double'},()=>({loader:'js',contents:`
       function element(tag='div',attrs={}) {
         return {tag,textContent:attrs.text||'',hidden:false,children:[],attributes:{},
-          empty(){this.children=[];},focus(){this.focused=true;},setAttribute(name,value){this.attributes[name]=value;},
+          empty(){this.children=[];},focus(){this.focused=true;},addEventListener(){},setAttribute(name,value){this.attributes[name]=value;},
           createEl(tag,attrs){const child=element(tag,attrs);this.children.push(child);return child;}};
       }
       class Control {
@@ -157,7 +157,7 @@ async function fixture() {
     runInNewContext(file.text,{module,exports:module.exports,state,URL:TestURL,Blob,Image:TestImage,document:{createElement:()=>canvas},setTimeout,clearTimeout,AbortController});
     Object.assign(exports,module.exports);
   }
-  const plugin={app:{},settings:{...DEFAULT_SETTINGS,...config},async updateSettings(patch:any){this.settings={...this.settings,...patch};}};
+  const plugin={app:{vault:{getName:()=> 'My vault'}},settings:{...DEFAULT_SETTINGS,...config},async updateSettings(patch:any){this.settings={...this.settings,...patch};}};
   const tab=new exports.InkstoneSettingsTab(plugin);tab.display();
   const row=(name:string)=>state.rows.findLast((item:any)=>item.name===name);
   const button=(label:string)=>row('Check AI configuration').controls.find((item:any)=>item.label===label);

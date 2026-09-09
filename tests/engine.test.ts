@@ -18,15 +18,16 @@ test('eraser distance covers dots, segment interiors, and endpoints', () => {
 class CanvasContext {
   arcs = 0;
   composites = 0;
+  visibleArcs: { x: number; y: number; radius: number }[] = [];
   fillStyle = '';
   fills: { width: number; height: number; color: string }[] = [];
   clips: { width: number; height: number }[] = [];
   constructor(readonly canvas: Canvas) {}
-  setTransform() {} clearRect() {} save() {} restore() {} beginPath() {} clip() {}
+  setTransform() {} clearRect() { this.visibleArcs = []; } save() {} restore() {} beginPath() {} clip() {}
   rect(_x: number, _y: number, width: number, height: number) { this.clips.push({ width, height }); }
   setLineDash() {} strokeRect() {} moveTo() {} lineTo() {} closePath() {} fill() {} stroke() {} fillText() {}
   fillRect(_x: number, _y: number, width: number, height: number) { this.fills.push({ width, height, color: this.fillStyle }); }
-  arc() { this.arcs++; }
+  arc(x: number, y: number, radius: number) { this.arcs++; this.visibleArcs.push({ x, y, radius }); }
   drawImage() { this.composites++; }
 }
 class Canvas {
@@ -964,5 +965,143 @@ test('curved pressure strokes share live, replay and SVG interpolation', () => {
     const before = host.canvases[0].context.arcs;
     engine.fit(); flush();
     assert.equal(host.canvases[0].context.arcs - before, liveArcs, 'reopening/redrawing uses the same geometry');
+  }, page);
+});
+
+
+test('temporary pen tip follows the pointer, replaces old tails, and clears on commit', () => {
+  const page = createDocument(); page.paper = 'blank';
+  withEngine(({ engine, host, pointer, flush }) => {
+    pointer('pointerdown', 200, 300);
+    pointer('pointermove', 240, 300);
+    const live = host.canvases[1].context, tip = host.canvases[2].context;
+    assert.ok(Math.abs(tip.visibleArcs.at(-1)!.x - 240) < 1e-8);
+    assert.ok(Math.abs(live.visibleArcs.at(-1)!.x - 220) < 1e-8, 'only the stable midpoint is committed');
+    pointer('pointermove', 240, 340);
+    assert.ok(Math.abs(tip.visibleArcs.at(-1)!.y - 340) < 1e-8);
+    assert.ok(tip.visibleArcs.every(p => p.y >= 320), 'old straight tail is removed as the curve rounds the corner');
+    const stableCount = live.visibleArcs.length;
+    engine.fit(); flush();
+    assert.equal(live.visibleArcs.length, stableCount, 'viewport redraw does not bake the temporary tail into stable ink');
+    const beforeCommit = live.arcs;
+    pointer('pointerup', 250, 350);
+    assert.equal(tip.visibleArcs.length, 0);
+    assert.equal((engine.exportSvg().match(/<circle /g) ?? []).length, stableCount + live.arcs - beforeCommit,
+      'commit and export contain each stable segment and the final tail exactly once');
+  }, page);
+});
+
+test('long active handwriting keeps new-sample interpolation work bounded', () => {
+  const page = createDocument(); page.paper = 'blank';
+  withEngine(({ host, pointer }) => {
+    pointer('pointerdown', 200, 300);
+    const live = host.canvases[1].context, tip = host.canvases[2].context;
+    for (let i = 1; i <= 300; i++) {
+      const before = live.arcs;
+      pointer('pointermove', 200 + i, 300 + Math.sin(i / 10) * 10);
+      assert.ok(live.arcs - before <= 48);
+      assert.ok(tip.visibleArcs.length <= 48);
+    }
+    assert.equal(host.canvases[0].context.arcs, 0, 'historical layer is untouched throughout writing');
+  }, page);
+});
+
+
+test('unsmoothed pen geometry stays exact through rendering and persistence', () => {
+  const page = createDocument(); page.paper = 'blank';
+  page.strokes = [{ id: 'exact', tool: 'pen', color: '#123456', width: 3, smoothing: 'none', points: [
+    { x: 200, y: 300, pressure: 0.5, time: 0 },
+    { x: 240, y: 300, pressure: 0.5, time: 10 },
+    { x: 280, y: 310, pressure: 0.5, time: 20 },
+  ] }];
+  const restored = parseDocument(JSON.stringify({ version: 2, pages: [page] })).pages[0];
+  withEngine(({ engine, host }) => {
+    assert.deepEqual(host.canvases[0].context.visibleArcs.map(({ x, y }) => ({ x, y })),
+      page.strokes[0].points.map(({ x, y }) => ({ x, y })));
+    assert.equal((engine.exportSvg().match(/<circle /g) ?? []).length, 3);
+  }, restored);
+});
+
+test('rectangle selection accepts reversed diagonals and encloses only complete strokes and images', () => {
+  const page = createDocument();
+  const point = (x: number, y: number) => ({ x, y, pressure: 0.5, time: 0 });
+  page.strokes = [
+    { id: 'inside', tool: 'pen', color: '#123456', width: 3, points: [point(220, 320), point(260, 340)] },
+    { id: 'crossing', tool: 'pen', color: '#123456', width: 3, points: [point(250, 360), point(450, 360)] },
+  ];
+  page.images = [{ id: 'image', x: 300, y: 320, width: 40, height: 40, src: 'data:image/png;base64,aGVsbG8=' }];
+  withEngine(({ engine, pointer, changes }) => {
+    engine.setTool('lasso'); engine.setSelectionMode('rectangle');
+    pointer('pointerdown', 400, 400); pointer('pointerup', 200, 300);
+    assert.ok(engine.getSelectionBounds());
+    engine.deleteSelection();
+    assert.deepEqual(engine.getDocument().strokes.map(s => s.id), ['crossing']);
+    assert.deepEqual(engine.getDocument().images, []);
+    assert.equal(changes.length, 1, 'selecting adds no history transaction');
+    engine.undo(); assert.deepEqual(engine.getDocument(), page);
+  }, page);
+});
+
+test('selection clipboard snapshots mixed content and each paste is one reversible edit', () => {
+  const page = createDocument();
+  page.strokes = [{ id: 'ink', tool: 'pen', color: '#123456', width: 3, smoothing: 'none', points: [
+    { x: 220, y: 320, pressure: 0.2, time: 10 }, { x: 260, y: 340, pressure: 0.8, time: 20 },
+  ] }];
+  page.images = [{ id: 'image', x: 300, y: 320, width: 40, height: 40, src: 'data:image/png;base64,aGVsbG8=' }];
+  withEngine(({ engine, pointer, changes }) => {
+    engine.setTool('lasso'); engine.setSelectionMode('rectangle');
+    pointer('pointerdown', 200, 300); pointer('pointerup', 400, 400);
+    engine.copySelection(); assert.equal(changes.length, 0);
+    engine.recolorSelection('#ff0000');
+    engine.pasteSelection();
+    const pasted = engine.getDocument();
+    assert.equal(changes.length, 2); assert.equal(pasted.strokes.length, 2); assert.equal(pasted.images!.length, 2);
+    const ink = pasted.strokes[1], image = pasted.images![1];
+    assert.notEqual(ink.id, page.strokes[0].id); assert.notEqual(image.id, page.images![0].id);
+    assert.equal(ink.color, '#123456', 'copy retains the earlier color'); assert.equal(ink.smoothing, 'none');
+    assert.deepEqual(ink.points, page.strokes[0].points.map(p => ({ ...p, x: p.x + 24, y: p.y + 24 })));
+    assert.equal(image.x, 324); assert.equal(image.y, 344); assert.equal(image.src, page.images![0].src);
+    engine.undo(); assert.equal(engine.getDocument().strokes.length, 1); assert.equal(engine.getDocument().images!.length, 1);
+    engine.redo(); assert.deepEqual(engine.getDocument(), pasted);
+    engine.pasteSelection();
+    const repeated = engine.getDocument();
+    assert.equal(new Set(repeated.strokes.map(s => s.id)).size, 3);
+    assert.equal(new Set(repeated.images!.map(i => i.id)).size, 3);
+  }, page);
+});
+
+test('cut keeps the clipboard after undo and page changes', () => {
+  const page = createDocument();
+  page.strokes = [{ id: 'cut-ink', tool: 'pen', color: '#123456', width: 3, points: [
+    { x: 220, y: 320, pressure: 0.3, time: 10 }, { x: 260, y: 340, pressure: 0.7, time: 20 },
+  ] }];
+  withEngine(({ engine, pointer, changes }) => {
+    engine.setTool('lasso'); engine.setSelectionMode('rectangle');
+    pointer('pointerdown', 200, 300); pointer('pointerup', 400, 400);
+    engine.cutSelection(); assert.equal(engine.getDocument().strokes.length, 0); assert.equal(changes.length, 1);
+    engine.undo(); assert.deepEqual(engine.getDocument(), page);
+    const target = createDocument(); engine.setDocument(target);
+    engine.pasteSelection();
+    assert.equal(engine.getDocument().strokes.length, 1); assert.equal(engine.getDocument().id, target.id);
+    assert.deepEqual(engine.getDocument().strokes[0].points.map(p => p.pressure), [0.3, 0.7]);
+    engine.undo(); assert.deepEqual(engine.getDocument(), target);
+  }, page);
+});
+
+test('pasting near page edges preserves stroke shape and the layout of mixed selections', () => {
+  const page = createDocument();
+  page.strokes = [{ id: 'edge-ink', tool: 'pen', color: '#123456', width: 3, points: [
+    { x: 1350, y: 320, pressure: 0.3, time: 10 }, { x: 1390, y: 340, pressure: 0.7, time: 20 },
+  ] }];
+  page.images = [{ id: 'edge-image', x: 1350, y: 360, width: 40, height: 40, src: 'data:image/png;base64,aGVsbG8=' }];
+  withEngine(({ engine, pointer }) => {
+    engine.setTool('lasso'); engine.setSelectionMode('rectangle');
+    pointer('pointerdown', 1340, 300); pointer('pointerup', 1399, 410);
+    engine.copySelection(); engine.pasteSelection();
+    const ink = engine.getDocument().strokes[1], image = engine.getDocument().images![1];
+    assert.equal(ink.points[1].x - ink.points[0].x, 40, 'page boundary must not flatten the stroke');
+    assert.equal(image.x - ink.points[0].x, 0, 'group offsets remain unchanged');
+    assert.equal(image.y - ink.points[0].y, 40);
+    assert.ok(ink.points[1].x <= 1400); assert.ok(image.x + image.width <= 1400);
   }, page);
 });

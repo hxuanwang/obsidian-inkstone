@@ -40,7 +40,7 @@ export function formatPage(page: InkPage, format: PageFormat & { paper?: Paper }
     }) } : {}) };
 }
 export type Point = { x: number; y: number; pressure: number; time: number };
-export type Stroke = { id: string; tool: 'pen' | 'highlighter'; color: string; width: number; points: Point[] };
+export type Stroke = { id: string; tool: 'pen' | 'highlighter'; color: string; width: number; points: Point[]; smoothing?: 'none' };
 export const PAPER_TYPES = ['blank', 'ruled', 'grid', 'dots', 'cornell', 'music', 'isometric', 'planner'] as const;
 export type Paper = typeof PAPER_TYPES[number];
 export type PageImage = { id: string; x: number; y: number; width: number; height: number; src: string };
@@ -99,7 +99,7 @@ export function parseDocument(text: string): InkDocument {
         if (!record(point) || !finite(point.x) || !finite(point.y) || Math.abs(point.x) > 100_000 || Math.abs(point.y) > 100_000 || !finite(point.pressure) || point.pressure < 0 || point.pressure > 1 || !finite(point.time)) throw new Error('The note contains an invalid ink point.');
         return { x: point.x, y: point.y, pressure: point.pressure, time: point.time };
       });
-      return { id: stroke.id, tool: stroke.tool as Stroke['tool'], color: stroke.color, width: stroke.width, points };
+      return { id: stroke.id, tool: stroke.tool as Stroke['tool'], color: stroke.color, width: stroke.width, points, ...(stroke.smoothing === 'none' ? { smoothing: 'none' as const } : {}) };
     });
     let textBoxes: TextBox[] | undefined;
     if (raw.textBoxes !== undefined) {

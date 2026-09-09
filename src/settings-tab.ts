@@ -2,6 +2,7 @@ import { PluginSettingTab, Setting, requestUrl } from 'obsidian';
 import { fetchModels, testProvider } from './ai-provider';
 import type InkstonePlugin from './main';
 import type { InkstoneSettings } from './settings';
+import { pencilSqueezeShortcutUrl } from './pencil-shortcut';
 export class InkstoneSettingsTab extends PluginSettingTab {
   constructor(private inkstone: InkstonePlugin) {super(inkstone.app,inkstone);}
   private displayVersion=0;
@@ -21,9 +22,17 @@ export class InkstoneSettingsTab extends PluginSettingTab {
     new Setting(this.containerEl).setName('Recognition delay').setDesc('Wait after the last ink change. A longer delay reduces repeated OCR while writing.').addSlider(control=>control.setLimits(800,10000,200).setValue(this.inkstone.settings.recognitionDelayMs).setDynamicTooltip().onChange(async value=>{await this.inkstone.updateSettings({recognitionDelayMs:value});}));
     new Setting(this.containerEl).setName('Real-time spell-check').setDesc('Red wavy underlines flag possible English spelling mistakes in on-page text and recognized handwriting. Handwriting checks run after OCR; names and technical terms may be flagged. Text fields also use system spelling.').addToggle(control=>control.setValue(this.inkstone.settings.spellcheck).onChange(async value=>{await this.inkstone.updateSettings({spellcheck:value});}));
     this.containerEl.createEl('h3',{text:'Apple Pencil actions'});
-    this.containerEl.createEl('p',{text:'Obsidian’s web plugin API does not expose native Apple Pencil squeeze, double-tap, or the iPad system Pencil preference. These action mappings can be invoked through Inkstone commands and a future native host bridge. Hardware gestures require host support.'});
+    this.containerEl.createEl('p',{text:'Direct hardware double-tap and squeeze are unavailable in Obsidian’s public plugin API. Changing these mappings alone does not enable the gestures. Apple Pencil Pro squeeze can use the iPad Shortcuts setup below; double-tap requires native Obsidian support.'});
     const actions={eraser:'Switch current tool / eraser',previous:'Switch current / previous tool',palette:'Show tool palette',undo:'Undo',none:'Do nothing'};
-    dropdown('Double-tap action','doubleTap',actions);dropdown('Squeeze action','squeeze',actions);
+    dropdown('Double-tap command action','doubleTap',actions,'Used by the Run Pencil double-tap action command only. Physical double-tap is not detected.');
+    dropdown('Squeeze shortcut action','squeeze',actions,'Used by the squeeze Shortcut URL and Run Pencil squeeze action command.');
+    this.containerEl.createEl('p',{text:'Apple Pencil Pro setup: create an iPad Shortcut with the URL below and the Open URLs action. In iPad Settings → Apple Pencil → Squeeze → Run Shortcut, select it. Keep this vault and an Inkstone writing page open, then squeeze. This uses iPadOS Shortcuts, may briefly switch apps, and still needs verification on your iPad.'});
+    new Setting(this.containerEl).setName('Squeeze Shortcut URL').setDesc('Copy this entire URL into the Shortcut. It is specific to this vault.').addText(control=>{
+      control.setValue(pencilSqueezeShortcutUrl(this.inkstone.app.vault.getName()));
+      control.inputEl.readOnly=true;
+      control.inputEl.addEventListener('focus',()=>control.inputEl.select());
+    });
+    this.containerEl.createEl('p',{text:'Without Shortcuts, use the Inkstone commands Switch writing tool / eraser, Switch to previous tool, and Toggle tool palette from the command palette or assign keyboard hotkeys.'});
     this.containerEl.createEl('h3',{text:'External OCR and AI conversion'});
     this.containerEl.createEl('p',{text:'Use Recognize with external AI in the text panel for cursive, multilingual handwriting, and formulas. It sends cropped pen ink to this provider only when requested. Background OCR stays local. AI page conversion offers Markdown or a standalone LaTeX document.'});
     this.containerEl.createEl('p',{text:'Optional. Use a vision-capable provider with the Chat Completions image format. Only pages you explicitly submit are sent. API keys are stored in this plugin’s data.json; vault sync may copy that file.'});

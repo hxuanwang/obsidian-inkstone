@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { build } from 'esbuild';
 import { runInNewContext } from 'node:vm';
 import { inkSignature } from '../src/ink-signature';
+import { pencilSqueezeShortcutUrl } from '../src/pencil-shortcut';
 const recognized = (text: string, strokes: any[]) => ({ text, words: [{ text, x: 8, y: 15, width: 80, height: 20 }], inkSignature: inkSignature(strokes) });
 const createDocument = (paper = 'ruled') => ({version:2,pages:[{id:'page1',title:'Page 1',paper,strokes:[],text:'',transcript:''}]});
 
@@ -26,7 +27,8 @@ const doubles: Record<string, string> = {
       constructor(app) { this.app = app; this.manifest = {id:'inkstone',dir:'.obsidian/plugins/inkstone'}; }
       registerView(_type, factory) { state.factory = factory; }
       async loadData() { return null; } async saveData() {} addSettingTab() {}
-      registerExtensions() {} addRibbonIcon() {} addCommand() {} registerEvent() {}
+      registerExtensions() {} addRibbonIcon() {} addCommand(command) { state.commands[command.id] = command; } registerEvent() {}
+      registerObsidianProtocolHandler(action, handler) { state.protocols[action] = handler; }
     }
     export class Setting {}
     export const requestUrl = async () => { throw new Error('Unexpected network request'); };
@@ -44,6 +46,7 @@ const doubles: Record<string, string> = {
       constructor(host, options) { this.options = options; state.editors.push(this); }
       setActivePage(id) { this.activePage = id; }
       setSearchQuery(query) { this.searchQuery = query; }
+      performPencilAction(action) { state.pencilActions.push(action); }
       destroy() { this.destroyed = true; if (this.pending) this.options.onChange(this.pending); }
     }
   `,
@@ -60,16 +63,86 @@ const bundled = build({
 });
 
 async function fixture() {
-  const state: any = { editors: [], saveRequests: 0, classes: [], messages: [] };
+  const state: any = { editors: [], saveRequests: 0, classes: [], messages: [], commands: {}, protocols: {}, pencilActions: [] };
   const module = { exports: {} as any };
   const result = await bundled;
   runInNewContext(result.outputFiles[0].text, { module, exports: module.exports, state, crypto, setTimeout, clearTimeout });
-  const plugin = new module.exports.default({ workspace: { on(event: string, callback: unknown) { if(event === "file-menu") state.fileMenu = callback; }, onLayoutReady() {}, getLeavesOfType() { return []; }, getActiveViewOfType() {return null;} }, vault: { configDir: '.obsidian', adapter: { getResourcePath(path: string) { return path; } }, on() {} } });
+  const plugin = new module.exports.default({ workspace: { on(event: string, callback: unknown) { if(event === "file-menu") state.fileMenu = callback; }, onLayoutReady() {}, getLeavesOfType() { return []; }, getActiveViewOfType() {return state.activeView ?? null;} }, vault: { configDir: '.obsidian', getName() {return 'My vault';}, adapter: { getResourcePath(path: string) { return path; } }, on() {} } });
   await plugin.onload();
   const fileA = { basename: 'First', path: 'First.inkstone' };
   const view = state.factory({ file: fileA });
   return { state, view, fileA, plugin };
 }
+
+test('squeeze Shortcut targets the current page and reads the current action mapping', async () => {
+  const { state, view, plugin } = await fixture();
+  view.setViewData(JSON.stringify(createDocument()), true);
+  state.activeView = view;
+  const squeeze = state.protocols['inkstone-pencil'];
+  squeeze({ action: 'inkstone-pencil', gesture: 'squeeze', vault: 'My vault' });
+  assert.deepEqual(state.pencilActions, ['palette']);
+  plugin.settings.squeeze = 'eraser';
+  squeeze({ action: 'inkstone-pencil', gesture: 'squeeze', vault: 'My vault' });
+  assert.deepEqual(state.pencilActions, ['palette', 'eraser']);
+  assert.equal(state.saveRequests, 0);
+});
+
+test('squeeze Shortcut rejects other gestures, mismatched vaults, and missing writing pages', async () => {
+  const { state, view } = await fixture();
+  view.setViewData(JSON.stringify(createDocument()), true);
+  state.activeView = view;
+  const squeeze = state.protocols['inkstone-pencil'];
+  squeeze({ action: 'inkstone-pencil', gesture: 'doubleTap' });
+  squeeze({ action: 'inkstone-pencil', gesture: 'squeeze', vault: 'Another vault' });
+  state.activeView = null;
+  squeeze({ action: 'inkstone-pencil', gesture: 'squeeze' });
+  assert.deepEqual(state.pencilActions, []);
+  assert.match(state.messages.join(' '), /gesture=squeeze.*open the vault.*open a writing page/);
+});
+
+test('direct tool commands only execute on writing pages and never execute during availability checks', async () => {
+  const { state, view } = await fixture();
+  view.setViewData(JSON.stringify(createDocument()), true);
+  for (const action of ['eraser', 'previous', 'palette']) {
+    const command = state.commands[`tool-${action}`];
+    assert.equal(command.checkCallback(false), false);
+    state.activeView = view;
+    assert.equal(command.checkCallback(true), true);
+    assert.equal(state.pencilActions.length, 0);
+    assert.equal(command.checkCallback(false), true);
+    assert.deepEqual(state.pencilActions, [action]);
+    state.pencilActions.length = 0;
+    state.activeView = null;
+  }
+});
+
+test('squeeze Shortcut URL encodes vault names and avoids Obsidian reserved action parameter', () => {
+  const url = new URL(pencilSqueezeShortcutUrl('研究 & Notes / 2026'));
+  assert.equal(url.hostname, 'inkstone-pencil');
+  assert.equal(url.searchParams.get('vault'), '研究 & Notes / 2026');
+  assert.equal(url.searchParams.get('gesture'), 'squeeze');
+  assert.equal(url.searchParams.has('action'), false);
+});
+
+test('Pencil command fallbacks use live mappings and respect command availability checks', async () => {
+  const { state, view, plugin } = await fixture();
+  view.setViewData(JSON.stringify(createDocument()), true);
+  for (const gesture of ['doubleTap', 'squeeze'] as const) {
+    const command = state.commands[`pencil-${gesture}`];
+    assert.equal(command.checkCallback(false), false);
+    state.activeView = view;
+    plugin.settings[gesture] = 'undo';
+    assert.equal(command.checkCallback(true), true);
+    assert.deepEqual(state.pencilActions, []);
+    assert.equal(command.checkCallback(false), true);
+    assert.deepEqual(state.pencilActions, ['undo']);
+    plugin.settings[gesture] = 'none';
+    command.checkCallback(false);
+    assert.deepEqual(state.pencilActions, ['undo', 'none']);
+    state.pencilActions.length = 0;
+    state.activeView = null;
+  }
+});
 
 test('preserves exact source until edited, then serializes the current document on save', async () => {
   const { state, view } = await fixture();

@@ -1,10 +1,10 @@
 # Inkstone for Obsidian
 
-A Pencil-first notebook plugin inspired by familiar Goodnotes and Notability workflows. Version 0.4 removes automatic vault-wide startup indexing, adds pixel/object erasers, follows Obsidian toolbar styling, and introduces optional AI Markdown and LaTeX conversion, a tool palette, and focus mode.
+A Pencil-first notebook plugin inspired by familiar Goodnotes and Notability workflows. Version 0.5 adds smoother variable-width ink, Photos/camera insertion choices, rectangle selection and a floating selection menu. Version 0.4 removes automatic vault-wide startup indexing, adds pixel/object erasers, follows Obsidian toolbar styling, and introduces optional AI Markdown and LaTeX conversion, a tool palette, and focus mode.
 
 ## Install
 
-Extract `release/inkstone-0.4.0.zip` and copy the complete `inkstone` folder into `<vault>/.obsidian/plugins/`. Enable **Inkstone** in Obsidian's community plugin settings. The installation must contain:
+Extract `release/inkstone-0.5.0.zip` and copy the complete `inkstone` folder into `<vault>/.obsidian/plugins/`. Enable **Inkstone** in Obsidian's community plugin settings. The installation must contain:
 
 - `main.js`, `manifest.json`, and `styles.css`
 - `assets/ocr/` and all files inside it (approximately 17 MB)
@@ -76,7 +76,16 @@ Chrome inherits Obsidian background/text/accent colors, interface font, icon siz
 
 Choose **Page actions → Focus writing**, or press Tab while the canvas is focused, to hide panels and toolbars. Escape or **Exit focus** restores them. Tool shortcuts: P pen, H highlighter, E eraser, L lasso, S shapes, V move, T text. They do not intercept typing in text fields.
 
-**Apple Pencil:** settings map double-tap and squeeze to current tool/eraser, previous tool, a floating tool palette, undo, or no action. Commands **Run Pencil double-tap action** and **Run Pencil squeeze action** execute those mappings and can be assigned Obsidian hotkeys. These are command fallbacks, not physical gesture detection. Obsidian's public plugin API does not expose native `UIPencilInteraction` or the iPad system Pencil preferences. Native squeeze/double-tap delivery and following system preferences require an Obsidian host bridge; a web event or a canvas double-click cannot substitute for those hardware gestures. See [Apple's native Pencil interaction API](https://developer.apple.com/documentation/uikit/uipencilinteraction).
+**Apple Pencil:** direct hardware double-tap and squeeze are unavailable in Obsidian's public plugin API. The double-tap mapping applies only to **Run Pencil double-tap action**, and changing it does not enable physical double-tap. Native support requires Obsidian to forward [Apple's `UIPencilInteraction` callbacks](https://developer.apple.com/documentation/uikit/uipencilinteraction). Use **Switch writing tool / eraser**, **Switch to previous tool**, and **Toggle tool palette** from the command palette or assign keyboard hotkeys as immediate alternatives.
+
+**Apple Pencil Pro squeeze via iPad Shortcuts:** Apple supports [running a Shortcut as the system squeeze action](https://developer.apple.com/documentation/applepencil/handling-squeezes-from-apple-pencil). Inkstone provides an Obsidian URL handler for this route:
+
+1. Copy **Squeeze Shortcut URL** from Inkstone settings. It includes your vault name and looks like `obsidian://inkstone-pencil?vault=My%20vault&gesture=squeeze`.
+2. In iPad Shortcuts, create a shortcut with a **URL** action containing that address, followed by **Open URLs**.
+3. In iPad Settings → Apple Pencil → Squeeze → Run Shortcut, select that shortcut.
+4. Keep that vault and an Inkstone writing page open. Squeezing runs the **Squeeze shortcut action** selected in Inkstone settings (tool palette by default).
+
+This is a system Shortcut workaround, not native gesture detection; it may briefly switch apps and needs validation on a physical iPad. Running the shortcut without an active writing page shows a notice. It does not open or edit another note automatically. The handler rejects other gestures and mismatched vaults. The **Run Pencil squeeze action** command also executes the same mapping without Shortcuts. See [Obsidian's public URI handler API](https://docs.obsidian.md/Reference/TypeScript+API/Plugin/registerObsidianProtocolHandler).
 
 ## Markdown, LaTeX, and optional AI conversion
 
@@ -87,3 +96,7 @@ For handwritten formulas, configure a vision-capable provider in **Settings → 
 Choose **Page actions → Convert page to Markdown or LaTeX with AI…** and select **Markdown (Obsidian math)** or **LaTeX document (.tex)**. The dialog identifies the destination before **Convert page** submits one page image (ink and positioned text). Markdown uses `$...$` and `$$` math; LaTeX requests a standalone document with a preamble and document environment. Review and edit the draft before saving a separate `.md` or `.tex` file next to the notebook. Original ink and transcripts are untouched. LaTeX output is source, not a compiled PDF; verify it with your TeX toolchain, especially language fonts and packages. Provider charges may apply. Closing the dialog discards late results but cannot cancel processing already accepted by the provider. Local Tesseract remains suitable for printed English text and is not designed for mathematical formula recognition.
 
 Automated regressions cover partial eraser geometry, sweep gaps, pressure/time preservation, eraser undo/redo, inactive startup indexing, coalesced index events, Markdown/LaTeX preservation, malformed AI output, and settings migration. Provider accuracy, real macOS energy consumption, and physical iPad Pencil gestures still require device/provider validation; no paid AI calls are made by the test suite.
+
+## Version 0.5 selection
+
+Choose the selection tool, then **Rectangle selection** or **Freehand lasso**. Drag around ink and images; move the selection or resize it with its corner handles. The floating menu offers preset/custom ink colors, cut, duplicate, delete, and More actions (copy, paste, resize, deselect). Copy/paste stays within this editor session; text boxes use the Text tool.

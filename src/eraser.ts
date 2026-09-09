@@ -1,12 +1,29 @@
 import type { Point, Stroke } from './model';
+import { penRadius, penSegment, penTail } from './pen-rendering';
+import { smoothInkSegment } from './geometry';
 type XY = { x: number; y: number };
 export type EraserMode = 'pixel' | 'object';
+
+/** Use the same centerline as canvas/SVG. Fragments retain these vertices so
+ * erasing does not fit a new curve through the surviving source samples. */
+function* renderedPoints(stroke: Stroke): Generator<Point> {
+  if (stroke.smoothing === 'none') { yield* stroke.points; return; }
+  if (stroke.tool === 'pen') {
+    if (!stroke.points.length) return;
+    yield stroke.points[0];
+    for (let i = 1; i < stroke.points.length; i++) yield* penSegment(stroke.points, i)!.points;
+    yield* penTail(stroke.points)!.points;
+  } else {
+    for (let i = 0; i < stroke.points.length; i++)
+      yield* smoothInkSegment(stroke.points[i], stroke.points[i - 1], stroke.points[i - 2]);
+  }
+}
 
 /** Clip centerline segments against the swept eraser capsule. Retain pressure/time
  * at cut boundaries and separate surviving fragments so gaps never reconnect. */
 export function eraseStroke(stroke: Stroke, from: XY, to: XY, radius: number, mode: EraserMode): Stroke[] {
   const vx = to.x - from.x, vy = to.y - from.y, length = vx * vx + vy * vy;
-  const inkRadius = (p: Point) => stroke.width * (stroke.tool === 'highlighter' ? .5 : .18 + p.pressure * .62);
+  const inkRadius = (p: Point) => stroke.tool === 'highlighter' ? stroke.width * .5 : penRadius(stroke.width, p.pressure);
   const mix = (a: Point, b: Point, t: number): Point => ({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,pressure:a.pressure+(b.pressure-a.pressure)*t,time:a.time+(b.time-a.time)*t});
   const distance = (p: XY) => {
     const t = length ? Math.max(0, Math.min(1, ((p.x-from.x)*vx+(p.y-from.y)*vy)/length)) : 0;
@@ -16,8 +33,11 @@ export function eraseStroke(stroke: Stroke, from: XY, to: XY, radius: number, mo
   let changed = false, run: Point[] = [];
   const fragments: Point[][] = [];
   const finish = () => { if(run.length) fragments.push(run); run=[]; };
-  for(let i=1;i<stroke.points.length;i++) {
-    const a=stroke.points[i-1], b=stroke.points[i], dx=b.x-a.x, dy=b.y-a.y;
+  let previous: Point | undefined;
+  for (const point of renderedPoints(stroke)) {
+    if (!previous) { previous = point; continue; }
+    const a = previous, b = point; previous = point;
+    const dx=b.x-a.x, dy=b.y-a.y;
     const r=radius+Math.max(inkRadius(a),inkRadius(b));
     const u=length?((a.x-from.x)*vx+(a.y-from.y)*vy)/length:0;
     const du=length?(dx*vx+dy*vy)/length:0;
@@ -43,5 +63,5 @@ export function eraseStroke(stroke: Stroke, from: XY, to: XY, radius: number, mo
   }
   finish();
   if(!changed)return [stroke];
-  return fragments.map(points=>({...stroke,id:crypto.randomUUID(),points}));
+  return fragments.map(points=>({...stroke,id:crypto.randomUUID(),points,smoothing:'none'}));
 }

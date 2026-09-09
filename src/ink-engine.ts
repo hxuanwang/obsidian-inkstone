@@ -1,6 +1,7 @@
 import { type InkPage as InkDocument, type PageFormat, type Paper, type PageImage, type Point, type Stroke, isImageSource, MAX_PAGE_IMAGES, pageDimensions, formatPage } from './model';
 import { eraseStroke, type EraserMode } from './eraser';
 import { createShape, type ShapeMode, pointInPolygon, enclosedStrokes, recognizeShape, smoothInkSegment, inkSegmentOutline } from './geometry';
+import { penRadius, penSegment, penTail, type PenSegment } from './pen-rendering';
 import { drawPaper, paperSvg } from './paper';
 export { PAGE_HEIGHT, PAGE_WIDTH } from './model';
 
@@ -12,7 +13,7 @@ type XY = { x: number; y: number };
 type HistoryEntry = { page: InkDocument; counterpart: InkDocument };
 const clamp = (n: number, low: number, high: number) => Math.min(high, Math.max(low, n));
 const distance = (a: XY, b: XY) => Math.hypot(a.x - b.x, a.y - b.y);
-const radius = (stroke: Stroke, point: Point) => stroke.width * (stroke.tool === 'highlighter' ? 0.5 : 0.18 + point.pressure * 0.62);
+const radius = (stroke: Stroke, point: Point) => stroke.tool === 'highlighter' ? stroke.width * 0.5 : penRadius(stroke.width, point.pressure);
 
 /** Distance to a segment, used for continuous eraser sweeps even between sparse events. */
 export function pointSegmentDistance(point: XY, a: XY, b: XY): number {
@@ -33,6 +34,7 @@ export class InkEngine {
   private readonly base = document.createElement('canvas');
   private readonly live = document.createElement('canvas');
   private readonly scratch = document.createElement('canvas');
+  private readonly tip = document.createElement('canvas');
   private readonly searchLayer = document.createElement('div');
   private searchHighlights: SearchHighlight[] = [];
   private searchHighlightIndices: number[] = [];
@@ -40,6 +42,7 @@ export class InkEngine {
   private readonly baseContext: CanvasRenderingContext2D;
   private readonly liveContext: CanvasRenderingContext2D;
   private readonly scratchContext: CanvasRenderingContext2D;
+  private readonly tipContext: CanvasRenderingContext2D;
   private readonly observer: ResizeObserver;
   private readonly abort = new AbortController();
   private document: InkDocument;
@@ -78,6 +81,8 @@ export class InkEngine {
   private frame = 0;
   private disposed = false;
   private selected = new Set<string>();
+  private selectionMode: 'rectangle' | 'freehand' = 'freehand';
+  private selectionClipboard: { strokes: Stroke[]; images: PageImage[] } | null = null;
   private lasso: { pointerId: number; points: XY[] } | null = null;
   private drag: { pointerId: number; origin: XY; before: InkDocument; dx: number; dy: number; anchor?: XY; box?: { left: number; right: number; top: number; bottom: number } } | null = null;
   private bounds = new WeakMap<Stroke, { left: number; top: number; right: number; bottom: number }>();
@@ -88,8 +93,9 @@ export class InkEngine {
     this.baseContext = this.context(this.base);
     this.liveContext = this.context(this.live);
     this.scratchContext = this.context(this.scratch);
+    this.tipContext = this.context(this.tip);
     this.host.classList.add('inkstone-canvas-host');
-    for (const canvas of [this.base, this.live]) {
+    for (const canvas of [this.base, this.live, this.tip]) {
       canvas.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;';
       canvas.setAttribute('aria-hidden', 'true');
       this.host.append(canvas);
@@ -367,6 +373,37 @@ export class InkEngine {
     this.searchLayer.style.transform = `translate(${this.offset.x}px, ${this.offset.y}px) scale(${this.zoom})`;
   }
 
+  setSelectionMode(mode: 'rectangle' | 'freehand'): void { this.finishSelection(true); this.selectionMode = mode; }
+  getSelectionBounds() { return this.selectionBox(); }
+  copySelection(): void {
+    this.finishSelection();
+    if (!this.selected.size) return;
+    this.selectionClipboard = { strokes: this.document.strokes.filter(s => this.selected.has(s.id)), images: (this.document.images ?? []).filter(i => this.selected.has(i.id)) };
+  }
+  cutSelection(): void { this.copySelection(); this.deleteSelection(); }
+  pasteSelection(): void {
+    const clip = this.selectionClipboard;
+    if (!clip || (this.document.images?.length ?? 0) + clip.images.length > MAX_PAGE_IMAGES) return;
+    const bounds = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+    const include = (x: number, y: number) => { bounds.left = Math.min(bounds.left, x); bounds.top = Math.min(bounds.top, y); bounds.right = Math.max(bounds.right, x); bounds.bottom = Math.max(bounds.bottom, y); };
+    for (const stroke of clip.strokes) for (const p of stroke.points) include(p.x, p.y);
+    for (const image of clip.images) { include(image.x, image.y); include(image.x + image.width, image.y + image.height); }
+    const scale = Math.min(1, this.pageSize.width / Math.max(1, bounds.right - bounds.left), this.pageSize.height / Math.max(1, bounds.bottom - bounds.top));
+    const x = clamp(bounds.left + 24, 0, this.pageSize.width - (bounds.right - bounds.left) * scale);
+    const y = clamp(bounds.top + 24, 0, this.pageSize.height - (bounds.bottom - bounds.top) * scale);
+    const transform = (p: XY) => ({ x: x + (p.x - bounds.left) * scale, y: y + (p.y - bounds.top) * scale });
+    const strokes = clip.strokes.map(s => ({ ...s, id: crypto.randomUUID(), width: s.width * scale, points: s.points.map(p => ({ ...p, ...transform(p) })) }));
+    const images = clip.images.map(i => ({ ...i, id: crypto.randomUUID(), ...transform(i), width: i.width * scale, height: i.height * scale }));
+    this.selected = new Set([...strokes, ...images].map(i => i.id));
+    this.change({ ...this.document, strokes: [...this.document.strokes, ...strokes], images: [...(this.document.images ?? []), ...images] });
+    this.options.onSelectionChange?.(this.selected.size);
+  }
+  private selectionPolygon(): XY[] {
+    const points = this.lasso?.points ?? [];
+    if (this.selectionMode === 'freehand' || points.length < 2) return points;
+    const a = points[0], b = points[points.length - 1];
+    return [{x:a.x,y:a.y},{x:b.x,y:a.y},{x:b.x,y:b.y},{x:a.x,y:b.y}];
+  }
   clearSelection(): void { this.selected.clear(); this.options.onSelectionChange?.(0); this.scheduleRedraw(); }
   deleteSelection(): void {
     this.finishSelection();
@@ -440,7 +477,7 @@ export class InkEngine {
     }
     if (this.lasso) {
       if (!cancel) {
-        const polygon = this.lasso.points;
+        const polygon = this.selectionPolygon();
         this.selected = new Set([...enclosedStrokes(this.document.strokes, polygon), ...(this.document.images ?? []).filter(image => polygon.length >= 3 && [{ x: image.x, y: image.y }, { x: image.x + image.width, y: image.y }, { x: image.x, y: image.y + image.height }, { x: image.x + image.width, y: image.y + image.height }].every(p => pointInPolygon(p, polygon))).map(image => image.id)]);
       }
       this.lasso = null; this.options.onSelectionChange?.(this.selected.size); this.redraw();
@@ -448,6 +485,7 @@ export class InkEngine {
   }
   private drawSelection(): void {
     if (!this.selected.size && !this.lasso) return;
+    this.options.onSelectionChange?.(this.selected.size);
     this.live.style.opacity = '1';
     this.clipped(this.liveContext, () => {
       const context = this.liveContext;
@@ -458,8 +496,9 @@ export class InkEngine {
         for (const x of [box.left, box.right]) for (const y of [box.top, box.bottom]) { const r = 4 / this.zoom; context.fillRect(x-r, y-r, r*2, r*2); context.strokeRect(x-r, y-r, r*2, r*2); }
       }
       if (this.lasso?.points.length) {
-        context.beginPath(); context.moveTo(this.lasso.points[0].x, this.lasso.points[0].y);
-        for (const p of this.lasso.points.slice(1)) context.lineTo(p.x, p.y);
+        const polygon = this.selectionPolygon();
+        context.beginPath(); context.moveTo(polygon[0].x, polygon[0].y);
+        for (const p of polygon.slice(1)) context.lineTo(p.x, p.y);
         context.closePath(); context.stroke();
       }
       context.setLineDash([]);
@@ -492,9 +531,9 @@ export class InkEngine {
     if (rect.width < 1 || rect.height < 1) return;
     const previous = this.size;
     this.size = { x: rect.width, y: rect.height };
-    // Three backing stores together stay below about 48 MB, including on large Retina displays.
-    this.dpr = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(4_000_000 / (rect.width * rect.height)));
-    for (const canvas of [this.base, this.live, this.scratch]) {
+    // Four backing stores together stay below about 48 MB, including on large Retina displays.
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(3_000_000 / (rect.width * rect.height)));
+    for (const canvas of [this.base, this.live, this.scratch, this.tip]) {
       canvas.width = Math.max(1, Math.round(rect.width * this.dpr));
       canvas.height = Math.max(1, Math.round(rect.height * this.dpr));
     }
@@ -535,15 +574,33 @@ export class InkEngine {
     for (const vertex of outline.slice(1)) context.lineTo(vertex.x, vertex.y);
     context.closePath(); context.fill();
   }
-  private drawSample(context: CanvasRenderingContext2D, stroke: Stroke, index: number): void {
-    let previous = stroke.points[index - 1];
-    for (const point of smoothInkSegment(stroke.points[index], previous, stroke.points[index - 2])) {
+  private curved(stroke: Stroke): boolean { return stroke.tool === 'pen' && stroke.smoothing !== 'none'; }
+  private drawCurve(context: CanvasRenderingContext2D, stroke: Stroke, segment: PenSegment | null): void {
+    if (!segment) return;
+    let previous = segment.start;
+    for (const point of segment.points) {
       this.drawSegment(context, stroke, point, previous); previous = point;
     }
   }
-  private drawStroke(context: CanvasRenderingContext2D, stroke: Stroke): void {
+  private drawTip(stroke: Stroke): void {
+    this.clear(this.tipContext);
+    if (this.curved(stroke)) this.clipped(this.tipContext, () => this.drawCurve(this.tipContext, stroke, penTail(stroke.points)));
+  }
+  private drawSample(context: CanvasRenderingContext2D, stroke: Stroke, index: number): void {
+    if (this.curved(stroke)) {
+      if (index === 0) this.drawSegment(context, stroke, stroke.points[0]);
+      else this.drawCurve(context, stroke, penSegment(stroke.points, index));
+      return;
+    }
+    let previous = stroke.points[index - 1];
+    for (const point of stroke.smoothing === 'none' ? [stroke.points[index]] : smoothInkSegment(stroke.points[index], previous, stroke.points[index - 2])) {
+      this.drawSegment(context, stroke, point, previous); previous = point;
+    }
+  }
+  private drawStroke(context: CanvasRenderingContext2D, stroke: Stroke, includeTail = true): void {
     this.clipped(context, () => {
       for (let index = 0; index < stroke.points.length; index++) this.drawSample(context, stroke, index);
+      if (includeTail && this.curved(stroke)) this.drawCurve(context, stroke, penTail(stroke.points));
     });
   }
   private paper(page: InkDocument): void {
@@ -581,7 +638,8 @@ export class InkEngine {
     }
     this.renderOffset = { x: 0, y: 0 }; this.renderPage = null;
     this.clear(this.liveContext);
-    if (this.active) this.drawStroke(this.liveContext, this.active.stroke);
+    this.clear(this.tipContext);
+    if (this.active) { this.drawStroke(this.liveContext, this.active.stroke, false); this.drawTip(this.active.stroke); }
     else this.drawSelection();
   }
   private scheduleRedraw(): void {
@@ -722,7 +780,7 @@ export class InkEngine {
       this.pencilPointer = event.pointerId;
       this.cancelPagePull();
       // Pencil takes priority over any finger contact already on the glass.
-      if (this.active && this.touches.has(this.active.pointerId)) { this.active = null; this.clear(this.liveContext); }
+      if (this.active && this.touches.has(this.active.pointerId)) { this.active = null; this.clear(this.liveContext); this.clear(this.tipContext); }
       if (this.erase && this.touches.has(this.erase.pointerId)) this.finishErase();
       if ((this.lasso && this.touches.has(this.lasso.pointerId)) || (this.drag && this.touches.has(this.drag.pointerId))) this.finishSelection(true);
       this.touches.clear(); this.pan = null;
@@ -736,7 +794,7 @@ export class InkEngine {
       this.touches.set(event.pointerId, local);
       if (this.touches.size > 1) {
         this.cancelPagePull();
-        if (this.active && this.touches.has(this.active.pointerId)) { this.active = null; this.clear(this.liveContext); }
+        if (this.active && this.touches.has(this.active.pointerId)) { this.active = null; this.clear(this.liveContext); this.clear(this.tipContext); }
         this.finishErase(); this.finishSelection(true); this.pan = null; return;
       }
     }
@@ -761,11 +819,11 @@ export class InkEngine {
       return;
     }
     const tool = this.tool === 'highlighter'  ? 'highlighter' : 'pen';
-    const stroke: Stroke = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`, tool, color: this.color, width: this.width, points: [point] };
+    const stroke: Stroke = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`, tool, color: this.color, width: this.width, points: [point], ...(this.tool === 'shape' ? { smoothing: 'none' as const } : {}) };
     this.shapeStart = this.tool === 'shape' && this.shapeMode !== 'auto' ? point : null;
     this.active = { pointerId: event.pointerId, stroke };
     this.live.style.opacity = tool === 'highlighter' ? '0.28' : '1';
-    this.clear(this.liveContext);
+    this.clear(this.liveContext); this.clear(this.tipContext);
     this.clipped(this.liveContext, () => this.drawSegment(this.liveContext, stroke, point));
   };
 
@@ -818,6 +876,7 @@ export class InkEngine {
           stroke.points.push(point); this.drawSample(this.liveContext, stroke, stroke.points.length - 1);
         }
       });
+      this.drawTip(stroke);
       return;
     }
     if (this.erase?.pointerId === event.pointerId) {
@@ -880,7 +939,9 @@ export class InkEngine {
     if (!this.active) return;
     let stroke = this.active.stroke; this.active = null; this.shapeStart = null;
     const shape = convertShape && this.tool === 'shape' && this.shapeMode === 'auto' ? recognizeShape(stroke.points) : null;
-    if (shape) { stroke = { ...stroke, points: shape }; this.clear(this.liveContext); this.drawStroke(this.liveContext, stroke); }
+    if (shape) { stroke = { ...stroke, points: shape, smoothing: 'none' }; this.clear(this.liveContext); this.drawStroke(this.liveContext, stroke); }
+    else if (this.curved(stroke)) this.clipped(this.liveContext, () => this.drawCurve(this.liveContext, stroke, penTail(stroke.points)));
+    this.clear(this.tipContext);
     this.undoStack.push({ page: this.document, counterpart: this.document }); if (this.undoStack.length > 100) this.undoStack.shift(); this.redoStack = [];
     this.document = { ...this.document, strokes: [...this.document.strokes, stroke] };
     // Commit the live layer without replaying historical strokes.
@@ -958,18 +1019,31 @@ export class InkEngine {
       // Only validated six-digit colors enter the SVG attribute.
       const color = /^#[0-9a-f]{6}$/i.test(stroke.color) ? stroke.color : '#243247';
       parts.push(`<g fill="${color}" opacity="${stroke.tool === 'highlighter' ? 0.28 : 1}">`);
+      const appendPoint = (point: Point, previous?: Point) => {
+        const r = radius(stroke, point);
+        parts.push(`<circle cx="${n(point.x)}" cy="${n(point.y)}" r="${n(r)}"/>`);
+        if (previous) {
+          const outline = inkSegmentOutline(previous, radius(stroke, previous), point, r);
+          if (outline.length) parts.push(`<path d="${outline.map((p, i) => `${i ? 'L' : 'M'}${n(p.x)} ${n(p.y)}`).join('')}Z"/>`);
+        }
+      };
+      const appendCurve = (segment: PenSegment | null) => {
+        if (!segment) return;
+        let previous = segment.start;
+        for (const point of segment.points) { appendPoint(point, previous); previous = point; }
+      };
       for (let index = 0; index < stroke.points.length; index++) {
-        let previous = stroke.points[index - 1];
-        for (const point of smoothInkSegment(stroke.points[index], previous, stroke.points[index - 2])) {
-          const r = radius(stroke, point);
-          parts.push(`<circle cx="${n(point.x)}" cy="${n(point.y)}" r="${n(r)}"/>`);
-          if (previous) {
-            const outline = inkSegmentOutline(previous, radius(stroke, previous), point, r);
-            if (outline.length) parts.push(`<path d="${outline.map((p, i) => `${i ? 'L' : 'M'}${n(p.x)} ${n(p.y)}`).join('')}Z"/>`);
+        if (this.curved(stroke)) {
+          if (index === 0) appendPoint(stroke.points[0]);
+          else appendCurve(penSegment(stroke.points, index));
+        } else {
+          let previous = stroke.points[index - 1];
+          for (const point of stroke.smoothing === 'none' ? [stroke.points[index]] : smoothInkSegment(stroke.points[index], previous, stroke.points[index - 2])) {
+            appendPoint(point, previous); previous = point;
           }
-          previous = point;
         }
       }
+      if (this.curved(stroke)) appendCurve(penTail(stroke.points));
       parts.push('</g>');
     }
     parts.push('</g></svg>'); return parts.join('');
@@ -979,8 +1053,8 @@ export class InkEngine {
     this.cancelPagePull();
     this.finishActive(); this.finishErase(); this.finishSelection(); this.disposed = true;
     this.abort.abort(); this.observer.disconnect(); if (this.frame) cancelAnimationFrame(this.frame);
-    this.base.remove(); this.live.remove(); this.eraserCursor.remove(); this.histories.clear(); this.searchLayer.replaceChildren(); this.searchLayer.remove(); this.searchHighlights = []; this.searchHighlightIndices = [];
-    for (const canvas of [this.base, this.live, this.scratch]) canvas.width = canvas.height = 1;
+    this.base.remove(); this.live.remove(); this.tip.remove(); this.eraserCursor.remove(); this.histories.clear(); this.searchLayer.replaceChildren(); this.searchLayer.remove(); this.searchHighlights = []; this.searchHighlightIndices = [];
+    for (const canvas of [this.base, this.live, this.scratch, this.tip]) canvas.width = canvas.height = 1;
     for (const image of this.imageCache.values()) image.onload = null; this.imageCache.clear();
     this.touches.clear();
   }

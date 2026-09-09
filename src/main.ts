@@ -1,4 +1,4 @@
-import { DEFAULT_SETTINGS, parseSettings, type InkstoneSettings } from './settings';
+import { DEFAULT_SETTINGS, parseSettings, type InkstoneSettings, type PencilAction } from './settings';
 import { InkstoneSettingsTab } from './settings-tab';
 import { notebookMarkdown } from './markdown';
 import { AIMarkdownModal } from './ai-modal';
@@ -89,6 +89,7 @@ class InkstoneView extends TextFileView {
 
   applySettings(): void { this.editor?.applySettings(this.plugin.settings); }
   pencilAction(gesture: 'doubleTap' | 'squeeze'): void { this.editor?.performPencilAction(this.plugin.settings[gesture]); }
+  toolAction(action: PencilAction): void { this.editor?.performPencilAction(action); }
   getDocument(): InkDocument { return this.document; }
   setActivePage(pageId: string): void { this.editor?.setActivePage(pageId); }
   setSearchQuery(query: string): void { this.editor?.setSearchQuery(query); }
@@ -256,6 +257,32 @@ export default class InkstonePlugin extends Plugin {
     this.settings=parseSettings(await this.loadData());
     this.addSettingTab(new InkstoneSettingsTab(this));
     for(const gesture of ['doubleTap','squeeze'] as const)this.addCommand({id:`pencil-${gesture}`,name:`Run Pencil ${gesture==='doubleTap'?'double-tap':'squeeze'} action`,checkCallback: checking => {const view=this.app.workspace.getActiveViewOfType(InkstoneView);if(!view)return false;if(!checking)view.pencilAction(gesture);return true;}});
+    for (const [action, name] of [['eraser', 'Switch writing tool / eraser'], ['previous', 'Switch to previous tool'], ['palette', 'Toggle tool palette']] as const) {
+      this.addCommand({id: `tool-${action}`, name, checkCallback: checking => {
+        const view = this.app.workspace.getActiveViewOfType(InkstoneView);
+        if (!view) return false;
+        if (!checking) view.toolAction(action);
+        return true;
+      }});
+    }
+    // Pencil hardware gestures are native UIKit events, unavailable to plugins.
+    // iPadOS can instead run a user-configured Shortcut on squeeze, opening this URI.
+    this.registerObsidianProtocolHandler('inkstone-pencil', params => {
+      if (params.gesture !== 'squeeze') {
+        new Notice('Inkstone: use gesture=squeeze in the Pencil shortcut URL.');
+        return;
+      }
+      if (params.vault && params.vault !== this.app.vault.getName()) {
+        new Notice('Inkstone: open the vault named in the Pencil shortcut first.');
+        return;
+      }
+      const view = this.app.workspace.getActiveViewOfType(InkstoneView);
+      if (!view) {
+        new Notice('Inkstone: open a writing page before running the Pencil shortcut.');
+        return;
+      }
+      view.pencilAction('squeeze');
+    });
     const pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
     this.recognizer = new LocalRecognizer(this.app.vault.adapter.getResourcePath(`${pluginDir}/assets/ocr`));
     this.externalRecognizer = new ExternalRecognizer(() => this.settings, requestUrl);
